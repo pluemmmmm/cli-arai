@@ -493,6 +493,115 @@ pub fn ghost_button(ui: &mut egui::Ui, label: &str) -> Response {
     .inner
 }
 
+/// Toggle switch control for top-bar layout toggles (e.g. Diff / AI / Terminal).
+/// Drawn with egui painter (no Unicode glyphs) and smooth macOS-style sliding thumb animation.
+pub fn panel_toggle_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    accent: Color32,
+) -> Response {
+    let t = active_theme(ui.ctx());
+    let font_id = egui::FontId::proportional(11.5);
+    let text_color = if active {
+        t.text_primary
+    } else {
+        t.text_muted
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font_id, text_color);
+
+    let pad_x = 8.0_f32;
+    let gap = 6.0_f32;
+    let track_w = 24.0_f32;
+    let track_h = 13.0_f32;
+    let total_w = pad_x + galley.size().x + gap + track_w + pad_x;
+    let total_h = 24.0_f32;
+
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, total_h), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let anim = ui.ctx().animate_bool_responsive(resp.id, active);
+
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+
+        // Subtle container background on hover
+        let container_bg = if resp.hovered() {
+            t.bg_hover
+        } else if active {
+            t.bg_surface
+        } else {
+            Color32::TRANSPARENT
+        };
+        let container_stroke = if resp.hovered() {
+            Stroke::new(1.0_f32, t.border_subtle)
+        } else if active {
+            Stroke::new(1.0_f32, t.border_hairline)
+        } else {
+            Stroke::NONE
+        };
+        p.rect(
+            rect,
+            CornerRadius::same(7),
+            container_bg,
+            container_stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        // Label on the left
+        let text_pos = egui::pos2(
+            rect.min.x + pad_x,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        p.galley(text_pos, galley, text_color);
+
+        // Toggle switch track on the right
+        let track_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.max.x - pad_x - track_w,
+                rect.center().y - track_h * 0.5,
+            ),
+            Vec2::new(track_w, track_h),
+        );
+        let track_radius = CornerRadius::same((track_h * 0.5) as u8);
+        let off_track = t.bg_hover;
+        let track_color = Color32::from_rgb(
+            egui::lerp(off_track.r() as f32..=accent.r() as f32, anim) as u8,
+            egui::lerp(off_track.g() as f32..=accent.g() as f32, anim) as u8,
+            egui::lerp(off_track.b() as f32..=accent.b() as f32, anim) as u8,
+        );
+        p.rect_filled(track_rect, track_radius, track_color);
+        if !active {
+            p.rect_stroke(
+                track_rect,
+                track_radius,
+                Stroke::new(1.0_f32, t.border_subtle),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        // Sliding circular thumb
+        let thumb_r = (track_h * 0.5) - 2.0;
+        let min_x = track_rect.min.x + thumb_r + 2.0;
+        let max_x = track_rect.max.x - thumb_r - 2.0;
+        let thumb_x = egui::lerp(min_x..=max_x, anim);
+        let thumb_color = if active {
+            Color32::WHITE
+        } else {
+            t.text_secondary
+        };
+        p.circle_filled(
+            egui::pos2(thumb_x, track_rect.center().y),
+            thumb_r,
+            thumb_color,
+        );
+    }
+
+    resp
+}
+
 /// Subtle outlined button: uniform `bg_surface` fill + `border_hairline` + smooth hover + pointer cursor.
 pub fn subtle_button(ui: &mut egui::Ui, label: &str) -> Response {
     let t = active_theme(ui.ctx());

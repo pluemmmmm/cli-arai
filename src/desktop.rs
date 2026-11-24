@@ -1,5 +1,5 @@
-use crate::ai::{self, AiProvider, AiRequestOptions, EffortLevel};
-use crate::changes::{ChangeTracker, DiffLine, DiffTag, FileChange};
+use crate::ai::{self, AiProvider, AiRequestOptions, AiStreamEvent, EffortLevel};
+use crate::changes::{self, ChangeTracker, CommitGraphRow, DiffLine, DiffTag, FileChange};
 use crate::config_rune::{self, LiveConfig};
 use crate::rune_engine;
 use crate::settings::AppSettings;
@@ -41,6 +41,12 @@ enum DiffViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Changes,
+    Graph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
     Ai,
@@ -51,9 +57,58 @@ enum SettingsTab {
 struct ChatMessage {
     role: String,
     content: String,
+    attachments: Vec<String>,
+    meta: Option<String>,
+    activities: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone)]
+impl ChatMessage {
+    fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            content: content.into(),
+            attachments: Vec::new(),
+            meta: None,
+            activities: Vec::new(),
+        }
+    }
+
+    fn error(content: impl Into<String>) -> Self {
+        Self {
+            role: "error".into(),
+            content: content.into(),
+            attachments: Vec::new(),
+            meta: None,
+            activities: Vec::new(),
+        }
+    }
+
+    fn user(content: impl Into<String>, attachments: Vec<String>) -> Self {
+        Self {
+            role: "you".into(),
+            content: content.into(),
+            attachments,
+            meta: None,
+            activities: Vec::new(),
+        }
+    }
+
+    fn ai(
+        role: impl Into<String>,
+        content: impl Into<String>,
+        meta: Option<String>,
+        activities: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            attachments: Vec::new(),
+            meta,
+            activities,
+        }
+    }
+}
+
 struct TermTab {
     id: usize,
     name: String,
@@ -64,11 +119,18 @@ struct TermTab {
     history: Vec<String>,
     history_idx: Option<usize>,
     busy: bool,
+    cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pty: Option<crate::pty_terminal::PtyTerminal>,
+    pty_error: Option<String>,
 }
 
 impl TermTab {
-    fn new(id: usize, cwd: PathBuf) -> Self {
+    fn new(id: usize, cwd: PathBuf, ctx: egui::Context) -> Self {
         let git_branch = detect_git_branch(&cwd);
+        let (pty, pty_error) = match crate::pty_terminal::PtyTerminal::spawn(&cwd, ctx) {
+            Ok(p) => (Some(p), None),
+            Err(e) => (None, Some(format!("Failed to start PTY shell: {e}"))),
+        };
         Self {
             id,
             name: format!("zsh {id}"),
@@ -79,12 +141,136 @@ impl TermTab {
             history: Vec::new(),
             history_idx: None,
             busy: false,
+            cancel_tx: None,
+            pty,
+            pty_error,
         }
+    }
+
+    fn cancel_running(&mut self) {
+        if let Some(tx) = self.cancel_tx.take() {
+            let _ = tx.send(());
+        }
+        self.busy = false;
+        self.lines.push(("^C".to_string(), TermLineKind::Error));
     }
 
     fn refresh_branch(&mut self) {
         self.git_branch = detect_git_branch(&self.cwd);
     }
+}
+
+/// Git Bash-style Tab Autocomplete for the integrated terminal.
+/// Returns `(updated_input, optional_candidates_preview)`.
+fn tab_complete_terminal(cwd: &std::path::Path, input: &str) -> (String, Option<String>) {
+    // Split into (before_last_token, last_token)
+    let (before, token) = match input.rfind(' ') {
+        Some(pos) => (&input[..=pos], &input[pos + 1..]),
+        None => ("", input),
+    };
+
+    let trimmed_before = before.trim();
+    let mut matches: Vec<String> = Vec::new();
+
+    // 1. Git branch completion (`git checkout <tab>`, `git switch <tab>`, `git merge <tab>`)
+    if matches!(
+        trimmed_before,
+        "git checkout" | "git switch" | "git merge" | "git rebase" | "git branch -d" | "git branch -D"
+    ) {
+        for b in list_git_branches(cwd) {
+            if b.starts_with(token) {
+                matches.push(b);
+            }
+        }
+    }
+    // 2. Git subcommand completion (`git <tab>`)
+    else if trimmed_before == "git" {
+        const GIT_SUBS: &[&str] = &[
+            "add", "branch", "checkout", "clone", "commit", "diff", "fetch", "init", "log",
+            "merge", "pull", "push", "rebase", "reset", "restore", "show", "stash", "status",
+            "switch", "tag",
+        ];
+        for sub in GIT_SUBS {
+            if sub.starts_with(token) {
+                matches.push((*sub).to_string());
+            }
+        }
+    }
+    // 3. File / directory completion (and common commands when completing the first word)
+    else {
+        let (dir_prefix, partial) = match token.rfind('/') {
+            Some(pos) => (&token[..=pos], &token[pos + 1..]),
+            None => ("", token),
+        };
+
+        let search_dir = if dir_prefix.is_empty() {
+            cwd.to_path_buf()
+        } else if let Some(rest) = dir_prefix.strip_prefix("~/") {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(rest))
+                .unwrap_or_else(|| cwd.join(dir_prefix))
+        } else {
+            cwd.join(dir_prefix)
+        };
+
+        if let Ok(entries) = std::fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Skip dotfiles unless user explicitly typed `.`
+                if name.starts_with('.') && !partial.starts_with('.') {
+                    continue;
+                }
+                if name.starts_with(partial) {
+                    let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    let suffix = if is_dir { "/" } else { "" };
+                    matches.push(format!("{dir_prefix}{name}{suffix}"));
+                }
+            }
+        }
+
+        // If completing the first word without `/`, also offer common shell/dev commands
+        if before.is_empty() && dir_prefix.is_empty() {
+            const CMDS: &[&str] = &[
+                "agy", "brew", "bun", "cargo", "cat", "cd", "clear", "code", "cp", "echo", "find",
+                "git", "grep", "ls", "mkdir", "mv", "node", "npm", "open", "pnpm", "pwd",
+                "python3", "rm", "rustc", "touch", "watchexec",
+            ];
+            for cmd in CMDS {
+                if cmd.starts_with(partial) && !matches.iter().any(|m| m == cmd) {
+                    matches.push((*cmd).to_string());
+                }
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return (input.to_string(), None);
+    }
+
+    if matches.len() == 1 {
+        let m = &matches[0];
+        let trailing = if m.ends_with('/') { "" } else { " " };
+        return (format!("{before}{m}{trailing}"), None);
+    }
+
+    // Multiple matches: complete longest common prefix + display candidates like Git Bash
+    let mut lcp = matches[0].clone();
+    for m in &matches[1..] {
+        let common_len = lcp
+            .chars()
+            .zip(m.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
+        lcp.truncate(common_len);
+    }
+
+    let updated = format!("{before}{lcp}");
+    let preview = matches.join("   ");
+    (updated, Some(preview))
 }
 
 /// Detect the real local machine hostname (short name via `hostname -s`).
@@ -155,12 +341,46 @@ enum BgEvent {
         models: Vec<String>,
         agents: Vec<String>,
     },
-    AiReply { provider: String, text: String },
+    AiStream(AiStreamEvent),
+    AiReply {
+        provider: String,
+        model: String,
+        text: String,
+        duration_ms: u128,
+    },
     AiError(String),
     RuneResult(String),
-    TerminalOutput { tab_id: usize, output: String, ok: bool },
+    TerminalLine {
+        tab_id: usize,
+        line: String,
+        is_err: bool,
+    },
+    TerminalDone {
+        tab_id: usize,
+    },
     ConfigReloaded(LiveConfig),
     ConfigError(String),
+}
+
+/// Strip ANSI CSI escape sequences (e.g. `\x1b[32m`) so dev-server output reads cleanly.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_hex_color(hex: &str, fallback: Color32) -> Color32 {
@@ -180,12 +400,158 @@ fn parse_hex_color(hex: &str, fallback: Color32) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Ensure only a single desktop instance runs at a time by closing any previous `cli-arai` instance.
+fn replace_existing_instance() {
+    let pid_path = std::env::temp_dir().join("cli-arai-desktop.pid");
+    let current_pid = std::process::id();
+
+    #[cfg(unix)]
+    if let Ok(content) = std::fs::read_to_string(&pid_path) {
+        if let Ok(old_pid) = content.trim().parse::<u32>() {
+            if old_pid != current_pid {
+                let is_same_app = std::process::Command::new("ps")
+                    .args(["-p", &old_pid.to_string(), "-o", "comm="])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().ends_with("cli-arai"))
+                    .unwrap_or(false);
+
+                if is_same_app {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-TERM", &old_pid.to_string()])
+                        .status();
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::write(&pid_path, current_pid.to_string());
+}
+
+/// Build a crisp 256x256 macOS-style rounded-square `?` icon for `cli arai`.
+fn build_app_icon() -> egui::IconData {
+    let size: usize = 256;
+    let mut rgba = vec![0u8; size * size * 4];
+    let s = size as f32;
+
+    // Helper: distance from point p to line segment a-b
+    let dist_seg = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
+        let pax = px - ax;
+        let pay = py - ay;
+        let bax = bx - ax;
+        let bay = by - ay;
+        let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay)).clamp(0.0, 1.0);
+        let dx = pax - bax * h;
+        let dy = pay - bay * h;
+        (dx * dx + dy * dy).sqrt()
+    };
+
+    // Signed distance for rounded box centered at (0, 0) with half-size b and corner radius r
+    let sd_round_box = |px: f32, py: f32, bx: f32, by: f32, r: f32| -> f32 {
+        let qx = px.abs() - bx + r;
+        let qy = py.abs() - by + r;
+        let out = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+        let inside = qx.max(qy).min(0.0);
+        out + inside - r
+    };
+
+    // Question mark geometry in normalized [-1, 1] coordinates
+    let stroke_r = 0.095_f32;
+    let arc_cx = 0.0_f32;
+    let arc_cy = -0.22_f32;
+    let arc_r = 0.25_f32;
+
+    for y in 0..size {
+        for x in 0..size {
+            // Normalized coords in [-1, 1]
+            let nx = ((x as f32 + 0.5) / s) * 2.0 - 1.0;
+            let ny = ((y as f32 + 0.5) / s) * 2.0 - 1.0;
+
+            // 1. Rounded square background (macOS Dock icon proportions)
+            let box_d = sd_round_box(nx, ny, 0.86, 0.86, 0.36);
+            let bg_alpha = (0.5 - box_d / 0.018).clamp(0.0, 1.0);
+            if bg_alpha <= 0.0 {
+                continue;
+            }
+
+            // Subtle dark gradient background (#171A21 -> #0E1015)
+            let grad = ((ny + 1.0) * 0.5).clamp(0.0, 1.0);
+            let mut r = (24.0 - grad * 10.0) as f32;
+            let mut g = (27.0 - grad * 11.0) as f32;
+            let mut b = (34.0 - grad * 13.0) as f32;
+
+            // Subtle inner highlight border
+            let border = (1.0 - (box_d + 0.02).abs() / 0.022).clamp(0.0, 1.0) * 0.22;
+            r += border * 120.0;
+            g += border * 128.0;
+            b += border * 145.0;
+
+            // 2. Question mark `?` SDF
+            let mut q_dist = 10.0_f32;
+
+            // Top arc: angle from -175° (left) through -90° (top) to +25° (right-bottom)
+            let dx = nx - arc_cx;
+            let dy = ny - arc_cy;
+            let ang = dy.atan2(dx); // [-PI, PI]
+            let start_ang = -3.05_f32; // ~ -175 deg
+            let end_ang = 0.45_f32;    // ~ +26 deg
+            if ang >= start_ang && ang <= end_ang {
+                let d_ring = ((dx * dx + dy * dy).sqrt() - arc_r).abs();
+                q_dist = q_dist.min(d_ring);
+            } else {
+                // Rounded end-caps of the arc
+                let sx = arc_cx + arc_r * start_ang.cos();
+                let sy = arc_cy + arc_r * start_ang.sin();
+                let ex = arc_cx + arc_r * end_ang.cos();
+                let ey = arc_cy + arc_r * end_ang.sin();
+                q_dist = q_dist
+                    .min(((nx - sx).powi(2) + (ny - sy).powi(2)).sqrt())
+                    .min(((nx - ex).powi(2) + (ny - ey).powi(2)).sqrt());
+            }
+
+            // Diagonal curve connecting arc end to vertical stem
+            let ex = arc_cx + arc_r * end_ang.cos();
+            let ey = arc_cy + arc_r * end_ang.sin();
+            q_dist = q_dist.min(dist_seg(nx, ny, ex, ey, 0.0, 0.14));
+
+            // Vertical stem down to (0.0, 0.28)
+            q_dist = q_dist.min(dist_seg(nx, ny, 0.0, 0.14, 0.0, 0.26));
+
+            // Dot at (0.0, 0.54)
+            let dot_d = (nx * nx + (ny - 0.54).powi(2)).sqrt() - 0.105;
+
+            let glyph_d = (q_dist - stroke_r).min(dot_d);
+            let glyph_alpha = (0.5 - glyph_d / 0.022).clamp(0.0, 1.0);
+
+            // Composite crisp white `?` over dark icon background
+            r = r * (1.0 - glyph_alpha) + 248.0 * glyph_alpha;
+            g = g * (1.0 - glyph_alpha) + 250.0 * glyph_alpha;
+            b = b * (1.0 - glyph_alpha) + 252.0 * glyph_alpha;
+
+            let idx = (y * size + x) * 4;
+            rgba[idx] = r.clamp(0.0, 255.0) as u8;
+            rgba[idx + 1] = g.clamp(0.0, 255.0) as u8;
+            rgba[idx + 2] = b.clamp(0.0, 255.0) as u8;
+            rgba[idx + 3] = (bg_alpha * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
+
 pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
+    replace_existing_instance();
     let cwd = std::env::current_dir()?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("cli arai")
+            .with_icon(build_app_icon())
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1024.0, 660.0])
             .with_fullsize_content_view(true)
@@ -198,8 +564,9 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
         "cli arai",
         options,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
             let loaded_settings = AppSettings::load();
+            let system_fonts = discover_system_fonts();
+            setup_fonts(&cc.egui_ctx, &loaded_settings.font_family, &system_fonts);
             ui_components::apply_theme(&cc.egui_ctx, loaded_settings.dark_mode);
             Ok(Box::new(DesktopApp::new(
                 rt,
@@ -207,13 +574,94 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
                 tracker,
                 cc.egui_ctx.clone(),
                 loaded_settings,
+                system_fonts,
             )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Desktop window error: {e}"))
 }
 
-fn setup_fonts(ctx: &egui::Context) {
+fn discover_system_fonts() -> Vec<(String, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = PathBuf::from(home);
+        dirs.push(h.join("Library/Fonts"));
+        dirs.push(h.join(".local/share/fonts"));
+    }
+    dirs.push(PathBuf::from("/Library/Fonts"));
+    dirs.push(PathBuf::from("/System/Library/Fonts"));
+    dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+    dirs.push(PathBuf::from("/usr/share/fonts"));
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext != "ttf" && ext != "otf" {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if stem.starts_with('.') {
+                    continue;
+                }
+                let display = stem.to_string();
+                let key = display.to_ascii_lowercase();
+                if seen.insert(key) {
+                    found.push((display, path));
+                }
+            }
+        }
+    }
+
+    found.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    found
+}
+
+fn setup_fonts(
+    ctx: &egui::Context,
+    selected_font_name: &str,
+    system_fonts: &[(String, PathBuf)],
+) {
+    let mut fonts = FontDefinitions::default();
+
+    // 1. User-selected system font (placed first in both Proportional & Monospace)
+    if !selected_font_name.is_empty() && selected_font_name != "Default" {
+        if let Some((_, path)) = system_fonts
+            .iter()
+            .find(|(name, _)| name == selected_font_name)
+        {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("user_font".to_owned(), Arc::new(FontData::from_owned(bytes)));
+                fonts
+                    .families
+                    .entry(FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "user_font".to_owned());
+                fonts
+                    .families
+                    .entry(FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "user_font".to_owned());
+            }
+        }
+    }
+
+    // 2. Thai fallback font so Thai text always renders cleanly
     let candidates = [
         "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
         "/System/Library/Fonts/Supplemental/Tahoma.ttf",
@@ -221,10 +669,8 @@ fn setup_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
     ];
-
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = FontDefinitions::default();
             fonts
                 .font_data
                 .insert("thai_font".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -238,10 +684,11 @@ fn setup_fonts(ctx: &egui::Context) {
                 .entry(FontFamily::Monospace)
                 .or_default()
                 .push("thai_font".to_owned());
-            ctx.set_fonts(fonts);
-            return;
+            break;
         }
     }
+
+    ctx.set_fonts(fonts);
 }
 
 struct DesktopApp {
@@ -266,20 +713,33 @@ struct DesktopApp {
     selected_agent: String,
     selected_effort: EffortLevel,
 
-    // Orca-style Diff Workspace
+    // Orca-style Diff Workspace & Commit Graph
+    sidebar_tab: SidebarTab,
     changes: Vec<FileChange>,
     selected_change_idx: usize,
+    commit_graph: Vec<CommitGraphRow>,
+    selected_commit_hash: Option<String>,
+    selected_commit_changes: Vec<FileChange>,
+    selected_commit_file_idx: usize,
     file_filter: String,
     diff_mode: DiffViewMode,
     last_auto_refresh: std::time::Instant,
 
-    // Bottom Dock: AI Prompt (Left) + Separate Terminal (Right)
-    show_bottom_dock: bool,
+    // Independent Panel Visibility Toggles: Diff Preview, AI Prompt, Terminal
+    show_diff_preview: bool,
+    show_ai_panel: bool,
+    show_terminal_panel: bool,
     bottom_split_ratio: f32,
     chat: Vec<ChatMessage>,
     prompt_input: String,
     attached_images: Vec<PathBuf>,
     ai_busy: bool,
+    ai_has_session: bool,
+    ai_conversation_id: Option<String>,
+    ai_status: String,
+    ai_started_at: Option<std::time::Instant>,
+    ai_live_thought: Option<String>,
+    ai_live_activities: Vec<(bool, String, String)>,
 
     term_tabs: Vec<TermTab>,
     active_term_idx: usize,
@@ -287,6 +747,7 @@ struct DesktopApp {
 
     // Persisted App Settings + Hot-reloadable Rune config (`config.rn`)
     settings: AppSettings,
+    system_fonts: Vec<(String, PathBuf)>,
     show_settings_modal: bool,
     settings_tab: SettingsTab,
     settings_status: Option<String>,
@@ -300,12 +761,180 @@ struct DesktopApp {
 }
 
 impl DesktopApp {
+    fn persist_ui_state(&mut self) {
+        self.settings.selected_provider_id = self.selected_provider_id.clone();
+        self.settings.selected_base_model = self.selected_base_model.clone();
+        self.settings.selected_level = self.selected_level.clone();
+        self.settings.selected_agent = self.selected_agent.clone();
+        self.settings.show_diff_preview = self.show_diff_preview;
+        self.settings.show_ai_panel = self.show_ai_panel;
+        self.settings.show_terminal_panel = self.show_terminal_panel;
+        let _ = self.settings.save();
+    }
+
+    fn render_ai_and_terminal_area(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        t: &ThemeColors,
+        accent: Color32,
+    ) {
+        let full_rect = ui.available_rect_before_wrap();
+        // Reserve full_rect in parent ui so TopBottomPanel preserves its height & resizes smoothly
+        ui.allocate_rect(full_rect, egui::Sense::hover());
+
+        match (self.show_ai_panel, self.show_terminal_panel) {
+            (true, true) => {
+                let gap = 10.0;
+                let total_w = (full_rect.width() - gap).max(300.0);
+                let min_pane_w = 220.0f32.min(total_w * 0.35);
+
+                let left_w = (total_w * self.bottom_split_ratio)
+                    .clamp(min_pane_w, (total_w - min_pane_w).max(min_pane_w));
+                let right_w = (total_w - left_w).max(min_pane_w);
+
+                let left_rect = egui::Rect::from_min_size(
+                    full_rect.min,
+                    Vec2::new(left_w, full_rect.height()),
+                );
+                let handle_rect = egui::Rect::from_min_size(
+                    egui::pos2(left_rect.max.x, full_rect.min.y),
+                    Vec2::new(gap, full_rect.height()),
+                );
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(handle_rect.max.x, full_rect.min.y),
+                    Vec2::new(right_w, full_rect.height()),
+                );
+
+                // Left Pane: AI
+                let mut left_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(left_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                left_ui.set_clip_rect(left_rect);
+                Frame::new()
+                    .fill(t.bg_code)
+                    .stroke(Stroke::new(1.0_f32, t.border_hairline))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(&mut left_ui, |ui| {
+                        ui.set_min_size(Vec2::new(
+                            (left_w - 24.0).max(80.0),
+                            (full_rect.height() - 24.0).max(80.0),
+                        ));
+                        ui.set_max_width((left_w - 24.0).max(80.0));
+                        self.render_bottom_prompt(ui);
+                    });
+
+                // Centered Draggable Split Handle between AI CHAT and TERMINAL
+                let handle_resp = ui
+                    .interact(
+                        handle_rect,
+                        ui.make_persistent_id("bottom_split_handle"),
+                        egui::Sense::drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+                if handle_resp.dragged() {
+                    if let Some(pointer) = ctx.pointer_interact_pos() {
+                        let new_left = (pointer.x - full_rect.min.x - gap * 0.5)
+                            .clamp(min_pane_w, total_w - min_pane_w);
+                        self.bottom_split_ratio = (new_left / total_w).clamp(0.15, 0.85);
+                    }
+                }
+
+                let grip_color = if handle_resp.dragged() {
+                    accent
+                } else if handle_resp.hovered() {
+                    t.text_secondary
+                } else {
+                    t.border_subtle
+                };
+                let grip_h = if handle_resp.hovered() || handle_resp.dragged() {
+                    48.0
+                } else {
+                    28.0
+                };
+                let grip_rect =
+                    egui::Rect::from_center_size(handle_rect.center(), Vec2::new(3.0, grip_h));
+                ui.painter()
+                    .rect_filled(grip_rect, CornerRadius::same(2), grip_color);
+
+                // Right Pane: TERMINAL
+                let mut right_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(right_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                right_ui.set_clip_rect(right_rect);
+                Frame::new()
+                    .fill(t.bg_code)
+                    .stroke(Stroke::new(1.0_f32, t.border_hairline))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(&mut right_ui, |ui| {
+                        ui.set_min_size(Vec2::new(
+                            (right_w - 24.0).max(80.0),
+                            (full_rect.height() - 24.0).max(80.0),
+                        ));
+                        ui.set_max_width((right_w - 24.0).max(80.0));
+                        self.render_bottom_terminal(ui);
+                    });
+            }
+            (true, false) => {
+                let mut ai_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(full_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                ai_ui.set_clip_rect(full_rect);
+                Frame::new()
+                    .fill(t.bg_code)
+                    .stroke(Stroke::new(1.0_f32, t.border_hairline))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(&mut ai_ui, |ui| {
+                        ui.set_min_size(Vec2::new(
+                            (full_rect.width() - 24.0).max(80.0),
+                            (full_rect.height() - 24.0).max(80.0),
+                        ));
+                        ui.set_max_width((full_rect.width() - 24.0).max(80.0));
+                        self.render_bottom_prompt(ui);
+                    });
+            }
+            (false, true) => {
+                let mut term_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(full_rect)
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                );
+                term_ui.set_clip_rect(full_rect);
+                Frame::new()
+                    .fill(t.bg_code)
+                    .stroke(Stroke::new(1.0_f32, t.border_hairline))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::same(12))
+                    .show(&mut term_ui, |ui| {
+                        ui.set_min_size(Vec2::new(
+                            (full_rect.width() - 24.0).max(80.0),
+                            (full_rect.height() - 24.0).max(80.0),
+                        ));
+                        ui.set_max_width((full_rect.width() - 24.0).max(80.0));
+                        self.render_bottom_terminal(ui);
+                    });
+            }
+            (false, false) => {}
+        }
+    }
+
     fn new(
         rt: Handle,
         cwd: PathBuf,
         tracker: ChangeTracker,
         ctx: egui::Context,
         settings: AppSettings,
+        system_fonts: Vec<(String, PathBuf)>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let changes = tracker.snapshot(&cwd);
@@ -321,6 +950,7 @@ impl DesktopApp {
         let branches = list_git_branches(&cwd);
 
         let hostname = detect_system_hostname();
+        let commit_graph = changes::collect_commit_graph(&cwd, 60);
 
         let app = Self {
             rt: rt.clone(),
@@ -334,32 +964,47 @@ impl DesktopApp {
             new_branch_input: String::new(),
             tracker,
             providers: Vec::new(),
-            selected_provider_id: None,
+            selected_provider_id: settings.selected_provider_id.clone(),
             raw_models: Vec::new(),
             grouped_models: Vec::new(),
-            selected_base_model: String::new(),
-            selected_level: None,
+            selected_base_model: settings.selected_base_model.clone(),
+            selected_level: settings.selected_level.clone(),
             available_agents: vec!["Default".to_string()],
-            selected_agent: "Default".to_string(),
+            selected_agent: if settings.selected_agent.is_empty() {
+                "Default".to_string()
+            } else {
+                settings.selected_agent.clone()
+            },
             selected_effort: EffortLevel::Medium,
+            sidebar_tab: SidebarTab::Changes,
             changes,
             selected_change_idx: 0,
+            commit_graph,
+            selected_commit_hash: None,
+            selected_commit_changes: Vec::new(),
+            selected_commit_file_idx: 0,
             file_filter: String::new(),
             diff_mode: DiffViewMode::Unified,
             last_auto_refresh: std::time::Instant::now(),
-            show_bottom_dock: true,
+            show_diff_preview: settings.show_diff_preview,
+            show_ai_panel: settings.show_ai_panel,
+            show_terminal_panel: settings.show_terminal_panel,
             bottom_split_ratio: 0.5,
-            chat: vec![ChatMessage {
-                role: "system".into(),
-                content: "พร้อมใช้งาน — พิมพ์พร้อมพ์เพื่อคุยกับ AI, กด ⚡ Rune เพื่อรันสคริปต์, หรือแก้ไฟล์ config.rn แล้วกด Save เพื่อ Hot Reload ทันที!".into(),
-            }],
+            chat: Vec::new(),
             prompt_input: String::new(),
             attached_images: Vec::new(),
             ai_busy: false,
-            term_tabs: vec![TermTab::new(1, cwd.clone())],
+            ai_has_session: false,
+            ai_conversation_id: None,
+            ai_status: String::new(),
+            ai_started_at: None,
+            ai_live_thought: None,
+            ai_live_activities: Vec::new(),
+            term_tabs: vec![TermTab::new(1, cwd.clone(), ctx.clone())],
             active_term_idx: 0,
             next_term_id: 2,
             settings,
+            system_fonts,
             show_settings_modal: false,
             settings_tab: SettingsTab::General,
             settings_status: None,
@@ -419,7 +1064,14 @@ impl DesktopApp {
         if self.selected_change_idx >= self.changes.len() && !self.changes.is_empty() {
             self.selected_change_idx = self.changes.len() - 1;
         }
+        self.commit_graph = changes::collect_commit_graph(&self.cwd, 60);
         self.refresh_git_branches();
+    }
+
+    fn select_commit(&mut self, hash: String) {
+        self.selected_commit_changes = changes::collect_commit_diff(&self.cwd, &hash);
+        self.selected_commit_file_idx = 0;
+        self.selected_commit_hash = Some(hash);
     }
 
     fn refresh_git_branches(&mut self) {
@@ -457,10 +1109,7 @@ impl DesktopApp {
                 if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
                     tab.lines.push((msg.clone(), TermLineKind::Success));
                 }
-                self.chat.push(ChatMessage {
-                    role: "system".into(),
-                    content: msg,
-                });
+                self.chat.push(ChatMessage::system(msg));
             }
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -468,17 +1117,11 @@ impl DesktopApp {
                 if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
                     tab.lines.push((msg.clone(), TermLineKind::Error));
                 }
-                self.chat.push(ChatMessage {
-                    role: "error".into(),
-                    content: msg,
-                });
+                self.chat.push(ChatMessage::error(msg));
             }
             Err(e) => {
                 let msg = format!("ไม่สามารถรัน git ได้: {e}");
-                self.chat.push(ChatMessage {
-                    role: "error".into(),
-                    content: msg,
-                });
+                self.chat.push(ChatMessage::error(msg));
             }
         }
     }
@@ -493,14 +1136,16 @@ impl DesktopApp {
             self.recent_projects.insert(0, new_dir.clone());
         }
         self.selected_change_idx = 0;
+        self.selected_commit_hash = None;
+        self.selected_commit_changes.clear();
+        self.selected_commit_file_idx = 0;
         self.file_filter.clear();
         self.refresh_changes();
 
         let msg = format!("สลับโปรเจกต์ไปที่: {}", new_dir.display());
-        self.chat.push(ChatMessage {
-            role: "system".into(),
-            content: msg.clone(),
-        });
+        self.ai_has_session = false;
+        self.ai_conversation_id = None;
+        self.chat.push(ChatMessage::system(msg.clone()));
         if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
             tab.cwd = new_dir;
             tab.refresh_branch();
@@ -548,15 +1193,11 @@ impl DesktopApp {
                     if let Some(pid) = self.active_provider().map(|p| p.id.clone()) {
                         self.fetch_provider_capabilities(pid);
                     }
-                    let summary = if available.is_empty() {
-                        "ยังไม่พบ AI CLI / API Key ในเครื่อง (รองรับ OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, Ollama, agy, claude, codex)".to_string()
-                    } else {
-                        format!("เชื่อมต่อ AI พร้อมใช้งาน: {}", available.join("  •  "))
-                    };
-                    self.chat.push(ChatMessage {
-                        role: "system".into(),
-                        content: summary,
-                    });
+                    if available.is_empty() {
+                        self.chat.push(ChatMessage::system(
+                            "ยังไม่พบ AI CLI / API Key ในเครื่อง (รองรับ OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, Ollama, agy, claude, codex)",
+                        ));
+                    }
                 }
                 BgEvent::ModelsAndAgentsLoaded { models, agents } => {
                     if !models.is_empty() {
@@ -587,46 +1228,118 @@ impl DesktopApp {
                         self.available_agents = agents;
                     }
                 }
-                BgEvent::AiReply { provider, text } => {
+                BgEvent::AiStream(stream_ev) => match stream_ev {
+                    AiStreamEvent::Status(s) => {
+                        self.ai_status = s;
+                    }
+                    AiStreamEvent::Thought(snippet) => {
+                        self.ai_live_thought = Some(snippet);
+                    }
+                    AiStreamEvent::ConversationId(cid) => {
+                        self.ai_conversation_id = Some(cid);
+                    }
+                    AiStreamEvent::Activity { done, verb, detail } => {
+                        if done {
+                            // Mark matching in-progress activity as done, or append completed one
+                            if let Some(existing) = self
+                                .ai_live_activities
+                                .iter_mut()
+                                .rev()
+                                .find(|(d, _, det)| !*d && (det == &detail || detail.is_empty()))
+                            {
+                                existing.0 = true;
+                                existing.1 = verb;
+                                if !detail.is_empty() {
+                                    existing.2 = detail;
+                                }
+                            } else {
+                                self.ai_live_activities.push((true, verb, detail));
+                            }
+                            self.refresh_changes();
+                        } else {
+                            self.ai_live_activities.push((false, verb, detail));
+                        }
+                    }
+                },
+                BgEvent::AiReply {
+                    provider,
+                    model,
+                    text,
+                    duration_ms,
+                } => {
                     self.ai_busy = false;
-                    self.chat.push(ChatMessage {
-                        role: provider,
-                        content: text,
-                    });
+                    self.ai_has_session = true;
+                    self.ai_status.clear();
+                    self.ai_started_at = None;
+                    let completed_acts: Vec<(String, String)> = self
+                        .ai_live_activities
+                        .drain(..)
+                        .map(|(_, verb, detail)| {
+                            let done_verb = match verb.as_str() {
+                                "Reading" => "Read".into(),
+                                "Editing" => "Edited".into(),
+                                "Running" => "Ran".into(),
+                                "Searching" => "Searched".into(),
+                                _ => verb,
+                            };
+                            (done_verb, detail)
+                        })
+                        .collect();
+                    let thought_part = self.ai_live_thought.take();
+                    let secs = duration_ms as f64 / 1000.0;
+                    let est_tok = (text.chars().count() / 4).max(1);
+                    let meta = match thought_part {
+                        Some(th) => format!("Thought for {secs:.1}s ({th}) · {model}"),
+                        None => format!("Thought for {secs:.1}s, ~{est_tok} tokens · {model}"),
+                    };
+                    self.chat
+                        .push(ChatMessage::ai(provider, text, Some(meta), completed_acts));
                     self.refresh_changes();
                 }
                 BgEvent::AiError(err) => {
                     self.ai_busy = false;
-                    self.chat.push(ChatMessage {
-                        role: "error".into(),
-                        content: err,
-                    });
+                    self.ai_status.clear();
+                    self.ai_started_at = None;
+                    self.ai_live_thought = None;
+                    self.ai_live_activities.clear();
+                    self.chat.push(ChatMessage::error(err));
                 }
                 BgEvent::RuneResult(out) => {
                     self.ai_busy = false;
-                    self.chat.push(ChatMessage {
-                        role: "rune".into(),
-                        content: out,
-                    });
+                    self.ai_status.clear();
+                    self.ai_started_at = None;
+                    self.chat.push(ChatMessage::ai(
+                        "rune",
+                        out,
+                        Some("Rune VM".into()),
+                        Vec::new(),
+                    ));
                     self.refresh_changes();
                 }
-                BgEvent::TerminalOutput { tab_id, output, ok } => {
+                BgEvent::TerminalLine {
+                    tab_id,
+                    line,
+                    is_err,
+                } => {
                     let max_lines = self.settings.max_terminal_lines.max(50);
                     if let Some(tab) = self.term_tabs.iter_mut().find(|t| t.id == tab_id) {
-                        tab.busy = false;
-                        tab.refresh_branch();
-                        let kind = if ok {
-                            TermLineKind::Output
-                        } else {
+                        let kind = if is_err {
                             TermLineKind::Error
+                        } else {
+                            TermLineKind::Output
                         };
-                        for line in output.lines() {
-                            tab.lines.push((line.to_string(), kind));
-                        }
+                        tab.lines.push((line, kind));
                         if tab.lines.len() > max_lines {
                             let excess = tab.lines.len() - max_lines;
                             tab.lines.drain(0..excess);
                         }
+                    }
+                }
+                BgEvent::TerminalDone { tab_id } => {
+                    if let Some(tab) = self.term_tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tab.busy = false;
+                        tab.cancel_tx = None;
+                        tab.refresh_branch();
                     }
                     self.refresh_changes();
                 }
@@ -702,16 +1415,15 @@ impl DesktopApp {
                 }
                 lines.join("\n")
             };
-            self.chat.push(ChatMessage {
-                role: "system".into(),
-                content,
-            });
+            self.chat.push(ChatMessage::system(content));
             self.refresh_providers();
             return;
         }
 
         if input == "/clear" {
             self.chat.clear();
+            self.ai_has_session = false;
+            self.ai_conversation_id = None;
             return;
         }
 
@@ -726,30 +1438,23 @@ impl DesktopApp {
             return;
         }
 
-        let display_msg = if attachments.is_empty() {
-            input.clone()
+        let attachment_names: Vec<String> = attachments
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+
+        let display_text = if input.is_empty() {
+            "(แนบรูปภาพ)".to_string()
         } else {
-            let names: Vec<String> = attachments
-                .iter()
-                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                .collect();
-            if input.is_empty() {
-                format!("[Image: {}]", names.join(", "))
-            } else {
-                format!("{input}\n[Image: {}]", names.join(", "))
-            }
+            input.clone()
         };
 
-        self.chat.push(ChatMessage {
-            role: "you".into(),
-            content: display_msg,
-        });
+        self.chat.push(ChatMessage::user(display_text, attachment_names));
 
         let Some(provider) = self.active_provider().cloned() else {
-            self.chat.push(ChatMessage {
-                role: "error".into(),
-                content: "ยังไม่มี AI provider ที่พร้อมใช้งาน — เลือกจากแถบด้านบน หรือคลิก 'Detect AI'".into(),
-            });
+            self.chat.push(ChatMessage::error(
+                "ยังไม่มี AI provider ที่พร้อมใช้งาน — ตรวจสอบการตั้งค่าหรือกด Refresh AI",
+            ));
             return;
         };
 
@@ -760,6 +1465,10 @@ impl DesktopApp {
         };
 
         self.ai_busy = true;
+        self.ai_status = "Loading...".to_string();
+        self.ai_started_at = Some(std::time::Instant::now());
+        self.ai_live_thought = None;
+        self.ai_live_activities.clear();
         let full_model = ai::resolve_full_model_id(
             &self.raw_models,
             &self.selected_base_model,
@@ -777,16 +1486,29 @@ impl DesktopApp {
             },
             timeout_secs: self.settings.request_timeout_secs,
             attachments,
+            continue_conversation: self.ai_has_session,
+            conversation_id: self.ai_conversation_id.clone(),
+            working_dir: Some(self.cwd.clone()),
         };
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let started = std::time::Instant::now();
         self.rt.spawn(async move {
-            match ai::ask_provider_with_options(&provider, &prompt_to_send, &opts).await {
+            let tx_ev = tx.clone();
+            let ctx_ev = ctx.clone();
+            match ai::ask_provider_streaming(&provider, &prompt_to_send, &opts, move |ev| {
+                let _ = tx_ev.send(BgEvent::AiStream(ev));
+                ctx_ev.request_repaint();
+            })
+            .await
+            {
                 Ok(reply) => {
-                    let model_label = opts.model.as_deref().unwrap_or("Auto");
+                    let model_label = opts.model.as_deref().unwrap_or("Auto").to_string();
                     let _ = tx.send(BgEvent::AiReply {
-                        provider: format!("{} · {}", provider.name, model_label),
+                        provider: provider.name,
+                        model: model_label,
                         text: reply,
+                        duration_ms: started.elapsed().as_millis(),
                     });
                 }
                 Err(e) => {
@@ -798,10 +1520,8 @@ impl DesktopApp {
     }
 
     fn run_rune_inline(&mut self, code: String) {
-        self.chat.push(ChatMessage {
-            role: "you".into(),
-            content: format!("/rune {code}"),
-        });
+        self.chat
+            .push(ChatMessage::user(format!("/rune {code}"), Vec::new()));
         self.ai_busy = true;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
@@ -819,10 +1539,10 @@ impl DesktopApp {
     }
 
     fn run_rune_file(&mut self, path: PathBuf) {
-        self.chat.push(ChatMessage {
-            role: "you".into(),
-            content: format!("/run {}", path.display()),
-        });
+        self.chat.push(ChatMessage::user(
+            format!("/run {}", path.display()),
+            Vec::new(),
+        ));
         self.ai_busy = true;
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
@@ -901,41 +1621,79 @@ impl DesktopApp {
         }
 
         tab.busy = true;
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        tab.cancel_tx = Some(cancel_tx);
         let tab_id = tab.id;
         let cwd = tab.cwd.clone();
         let shell = self.settings.shell.clone();
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         self.rt.spawn(async move {
-            let result = Command::new(&shell)
+            let child_res = Command::new(&shell)
                 .arg("-c")
                 .arg(&cmd)
                 .current_dir(&cwd)
-                .output()
-                .await;
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn();
 
-            match result {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let combined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-                        (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
-                        (false, true) => stdout.trim().to_string(),
-                        (true, false) => stderr.trim().to_string(),
-                        (true, true) => String::new(),
-                    };
-                    let _ = tx.send(BgEvent::TerminalOutput {
-                        tab_id,
-                        output: combined,
-                        ok: out.status.success(),
-                    });
+            match child_res {
+                Ok(mut child) => {
+                    // Stream stdout live line-by-line (so `pnpm dev`, `cargo build`, etc. show output immediately!)
+                    if let Some(stdout_pipe) = child.stdout.take() {
+                        let tx_out = tx.clone();
+                        let ctx_out = ctx.clone();
+                        tokio::spawn(async move {
+                            let mut reader =
+                                tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stdout_pipe));
+                            while let Ok(Some(line)) = reader.next_line().await {
+                                let clean = strip_ansi_codes(&line);
+                                let _ = tx_out.send(BgEvent::TerminalLine {
+                                    tab_id,
+                                    line: clean,
+                                    is_err: false,
+                                });
+                                ctx_out.request_repaint();
+                            }
+                        });
+                    }
+
+                    // Stream stderr live line-by-line
+                    if let Some(stderr_pipe) = child.stderr.take() {
+                        let tx_err = tx.clone();
+                        let ctx_err = ctx.clone();
+                        tokio::spawn(async move {
+                            let mut reader =
+                                tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(stderr_pipe));
+                            while let Ok(Some(line)) = reader.next_line().await {
+                                let clean = strip_ansi_codes(&line);
+                                let _ = tx_err.send(BgEvent::TerminalLine {
+                                    tab_id,
+                                    line: clean,
+                                    is_err: true,
+                                });
+                                ctx_err.request_repaint();
+                            }
+                        });
+                    }
+
+                    tokio::select! {
+                        _ = child.wait() => {
+                            let _ = tx.send(BgEvent::TerminalDone { tab_id });
+                        }
+                        _ = cancel_rx => {
+                            let _ = child.kill().await;
+                        }
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(BgEvent::TerminalOutput {
+                    let _ = tx.send(BgEvent::TerminalLine {
                         tab_id,
-                        output: format!("spawn error: {e}"),
-                        ok: false,
+                        line: format!("spawn error: {e}"),
+                        is_err: true,
                     });
+                    let _ = tx.send(BgEvent::TerminalDone { tab_id });
                 }
             }
             ctx.request_repaint();
@@ -1004,7 +1762,7 @@ impl DesktopApp {
                                     let lbl = egui::Label::new(
                                         RichText::new(&dl.content)
                                             .monospace()
-                                            .size(self.settings.code_font_size.clamp(9.0, 22.0))
+                                            .size(self.settings.diff_font_size.clamp(9.0, 22.0))
                                             .color(fg),
                                     );
                                     if self.settings.word_wrap_diff {
@@ -1053,34 +1811,36 @@ impl DesktopApp {
         }
     }
 
-    /// Bottom-Left: Gemini-Style AI Chat & Prompt Composer (with integrated AI Selector Dropdown)
+    /// Bottom-Left: Orca / Antigravity CLI Style AI Transcript & Monospace Prompt
     fn render_bottom_prompt(&mut self, ui: &mut egui::Ui) {
         let t = self.theme();
         let accent = self.accent_color();
+        let font_sz = self.settings.ai_font_size.clamp(10.0, 22.0);
 
-        // Unified header strip (AI CHAT left | Clear right)
+        // Minimal top strip (AI + spinner only | Clear right)
         ui.horizontal(|ui| {
-            ui_components::section_title(ui, "AI CHAT", t.accent_cyan);
+            ui_components::section_title(ui, "AI", t.accent_cyan);
             if self.ai_busy {
-                ui.spinner();
-                ui.label(RichText::new("thinking...").size(11.0).color(t.accent_cyan));
+                ui.add(egui::Spinner::new().size(13.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui_components::ghost_button(ui, "Clear").clicked() {
                     self.chat.clear();
+                    self.ai_has_session = false;
+                    self.ai_conversation_id = None;
                 }
             });
         });
         ui.separator();
 
-        // Gemini-Style Floating Rounded Composer Box (no awkward top separator line)
+        // Bottom Prompt Bar — Orca / Antigravity CLI style: full-width top 1px rule + `> input` + slim status/selector row
         let mut send_clicked = false;
         let mut refresh_ai_clicked = false;
         let has_ai = self.active_provider().is_some();
         let current_ai_label = self
             .active_provider()
             .map(|p| p.name.clone())
-            .unwrap_or_else(|| "No AI Available".to_string());
+            .unwrap_or_else(|| "No AI".to_string());
         let available_providers: Vec<(String, String)> = self
             .providers
             .iter()
@@ -1088,23 +1848,20 @@ impl DesktopApp {
             .map(|p| (p.id.clone(), p.name.clone()))
             .collect();
 
-        egui::TopBottomPanel::bottom("gemini_prompt_composer")
-            .show_separator_line(false)
+        egui::TopBottomPanel::bottom("orca_cli_prompt_bar")
+            .show_separator_line(true)
             .frame(
                 Frame::new()
-                    .fill(t.bg_surface)
-                    .stroke(Stroke::new(1.0, t.border_subtle))
-                    .corner_radius(CornerRadius::same(14))
-                    .inner_margin(Margin::symmetric(12, 8))
-                    .outer_margin(Margin {
-                        left: 0,
-                        right: 0,
+                    .fill(t.bg_code)
+                    .inner_margin(Margin {
+                        left: 2,
+                        right: 2,
                         top: 6,
-                        bottom: 0,
+                        bottom: 2,
                     }),
             )
             .show_inside(ui, |ui| {
-                // Row 0: Attached image chips (if any)
+                // Attached image chips above `>` line (if any)
                 if !self.attached_images.is_empty() {
                     let mut remove_idx: Option<usize> = None;
                     ui.horizontal_wrapped(|ui| {
@@ -1115,24 +1872,25 @@ impl DesktopApp {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| path.display().to_string());
                             Frame::new()
-                                .fill(t.bg_panel)
+                                .fill(t.bg_surface)
                                 .stroke(Stroke::new(1.0, t.border_hairline))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(7, 3))
+                                .corner_radius(CornerRadius::same(5))
+                                .inner_margin(Margin::symmetric(6, 2))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 5.0;
-                                        ui_components::icon_image(ui, t.accent_cyan, 13.0);
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui_components::icon_image(ui, t.accent_cyan, 12.0);
                                         ui.label(
                                             RichText::new(&name)
+                                                .monospace()
                                                 .size(11.0)
-                                                .color(t.text_primary),
+                                                .color(t.text_secondary),
                                         );
                                         if ui
                                             .add(
                                                 egui::Label::new(
                                                     RichText::new("×")
-                                                        .size(12.0)
+                                                        .size(11.5)
                                                         .color(t.text_muted),
                                                 )
                                                 .sense(egui::Sense::click()),
@@ -1152,27 +1910,38 @@ impl DesktopApp {
                     ui.add_space(4.0);
                 }
 
-                // Row 1: Compact auto-growing prompt input
-                let resp = ui.add_sized(
-                    [ui.available_width(), 24.0],
-                    TextEdit::multiline(&mut self.prompt_input)
-                        .frame(false)
-                        .desired_rows(1)
-                        .hint_text("พิมพ์คำถามให้ AI หรือลากรูปมาวางที่นี่... (Enter ส่ง, Shift+Enter ขึ้นบรรทัดใหม่)"),
-                );
+                // Line 1: Exact Orca CLI `> ` prompt line
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(
+                        RichText::new(">")
+                            .monospace()
+                            .strong()
+                            .size(font_sz + 0.5)
+                            .color(t.accent_indigo),
+                    );
+                    let resp = ui.add_sized(
+                        [(ui.available_width() - 4.0).max(80.0), (font_sz + 10.0).max(24.0)],
+                        TextEdit::multiline(&mut self.prompt_input)
+                            .frame(false)
+                            .font(egui::FontId::monospace(font_sz))
+                            .desired_rows(1)
+                            .text_color(t.text_primary),
+                    );
 
-                if resp.has_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
-                {
-                    if self.prompt_input.ends_with('\n') {
-                        self.prompt_input.pop();
+                    if resp.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+                    {
+                        if self.prompt_input.ends_with('\n') {
+                            self.prompt_input.pop();
+                        }
+                        send_clicked = true;
                     }
-                    send_clicked = true;
-                }
+                });
 
                 ui.add_space(4.0);
 
-                // Row 2: Responsive selector bar (never forces min width or snaps back)
+                // Line 2: Slim muted CLI status/selector row (Image | Provider | Model | Level | Agent | Send)
                 let mut switched_provider_id: Option<String> = None;
                 let composer_w = ui.available_width();
                 let very_compact = composer_w < 420.0;
@@ -1195,23 +1964,24 @@ impl DesktopApp {
                 let agent_w = if very_compact { 68.0 } else { 86.0 };
 
                 let mut attach_clicked = false;
+                let mut selectors_changed = false;
                 let mut render_selectors = |ui: &mut egui::Ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if ui_components::ghost_icon_button(ui, "Image", ui_components::icon_image)
-                        .on_hover_text("แนบรูปภาพสำหรับพร้อมพ์ (PNG, JPG, WebP, GIF)")
+                        .on_hover_text("แนบรูปภาพ (PNG, JPG, WebP, GIF)")
                         .clicked()
                     {
                         attach_clicked = true;
                     }
                     let dot_color = if has_ai { t.accent_emerald } else { t.accent_amber };
-                    ui_components::status_dot(ui, dot_color, 3.8);
+                    ui_components::status_dot(ui, dot_color, 3.5);
 
-                    // 1. Provider Selector
                     egui::ComboBox::from_id_salt("gemini_ai_selector")
                         .selected_text(
                             RichText::new(&current_ai_label)
-                                .size(11.5)
-                                .color(t.text_primary),
+                                .monospace()
+                                .size(11.0)
+                                .color(t.text_secondary),
                         )
                         .width(provider_w)
                         .show_ui(ui, |ui| {
@@ -1228,6 +1998,7 @@ impl DesktopApp {
                                     if ui.selectable_label(selected, name).clicked() && !selected {
                                         self.selected_provider_id = Some(id.clone());
                                         switched_provider_id = Some(id.clone());
+                                        selectors_changed = true;
                                     }
                                 }
                             }
@@ -1237,7 +2008,6 @@ impl DesktopApp {
                             }
                         });
 
-                    // 2. Grouped Base Model Selector (100% live from provider)
                     let mut newly_selected_base: Option<(String, Option<String>)> = None;
                     let model_display = if self.selected_base_model.is_empty() {
                         "Default".to_string()
@@ -1247,7 +2017,8 @@ impl DesktopApp {
                     egui::ComboBox::from_id_salt("gemini_model_selector")
                         .selected_text(
                             RichText::new(&model_display)
-                                .size(11.5)
+                                .monospace()
+                                .size(11.0)
                                 .color(t.text_secondary),
                         )
                         .width(model_w)
@@ -1275,9 +2046,9 @@ impl DesktopApp {
                     if let Some((base, lvl)) = newly_selected_base {
                         self.selected_base_model = base;
                         self.selected_level = lvl;
+                        selectors_changed = true;
                     }
 
-                    // 3. Level Selector
                     let current_levels: Vec<String> = self
                         .grouped_models
                         .iter()
@@ -1297,23 +2068,29 @@ impl DesktopApp {
                             _ => t.accent_rose,
                         };
                         egui::ComboBox::from_id_salt("gemini_effort_selector")
-                            .selected_text(RichText::new(&cur_lvl).size(11.5).color(lvl_color))
+                            .selected_text(
+                                RichText::new(&cur_lvl)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(lvl_color),
+                            )
                             .width(level_w)
                             .show_ui(ui, |ui| {
                                 for lvl in &current_levels {
                                     let selected = cur_lvl == *lvl;
                                     if ui.selectable_label(selected, lvl).clicked() {
                                         self.selected_level = Some(lvl.clone());
+                                        selectors_changed = true;
                                     }
                                 }
                             });
                     }
 
-                    // 4. Dynamic Agent Selector
                     egui::ComboBox::from_id_salt("gemini_agent_selector")
                         .selected_text(
                             RichText::new(&self.selected_agent)
-                                .size(11.5)
+                                .monospace()
+                                .size(11.0)
                                 .color(t.accent_cyan),
                         )
                         .width(agent_w)
@@ -1322,6 +2099,7 @@ impl DesktopApp {
                                 let selected = self.selected_agent == *a;
                                 if ui.selectable_label(selected, a).clicked() {
                                     self.selected_agent = a.clone();
+                                    selectors_changed = true;
                                 }
                             }
                         });
@@ -1364,6 +2142,10 @@ impl DesktopApp {
                     }
                 }
 
+                if selectors_changed {
+                    self.persist_ui_state();
+                }
+
                 if let Some(pid) = switched_provider_id {
                     self.fetch_provider_capabilities(pid);
                 }
@@ -1376,89 +2158,302 @@ impl DesktopApp {
             self.send_prompt(false);
         }
 
-        // Gemini-Style Clean Chat Feed
+        // Orca / Antigravity CLI Style Monospace Transcript Feed (no chat bubbles!)
         egui::ScrollArea::vertical()
             .id_salt("bottom_chat_scroll")
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 3.0;
                 ui.add_space(4.0);
-                let max_bubble_w = (ui.available_width() * 0.72).max(180.0);
 
-                for msg in &self.chat {
+                for (idx, msg) in self.chat.iter().enumerate() {
                     match msg.role.as_str() {
                         "you" => {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                Frame::new()
-                                    .fill(t.bg_surface)
-                                    .stroke(Stroke::new(1.0, t.border_hairline))
-                                    .corner_radius(CornerRadius::same(14))
-                                    .inner_margin(Margin::symmetric(12, 7))
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(max_bubble_w);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&msg.content)
-                                                    .size(12.5)
-                                                    .color(t.text_primary),
-                                            )
-                                            .wrap(),
-                                        );
-                                    });
-                            });
-                        }
-                        "system" => {
-                            ui.label(
-                                RichText::new(&msg.content)
-                                    .size(11.5)
-                                    .color(t.text_muted),
+                            // Thin horizontal divider above each user prompt (just like Orca CLI)
+                            if idx > 0 {
+                                ui.add_space(6.0);
+                            }
+                            let sep_rect = ui.available_rect_before_wrap();
+                            let line_w = (sep_rect.width() * 0.48).min(380.0);
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(sep_rect.left(), sep_rect.top()),
+                                    egui::pos2(sep_rect.left() + line_w, sep_rect.top()),
+                                ],
+                                Stroke::new(1.0, t.border_subtle),
                             );
-                        }
-                        "error" => {
-                            Frame::new()
-                                .fill(t.diff_del_bg)
-                                .corner_radius(CornerRadius::same(10))
-                                .inner_margin(Margin::symmetric(10, 7))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&msg.content)
-                                                .size(12.0)
-                                                .color(t.accent_rose),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
-                        }
-                        other => {
-                            ui.horizontal(|ui| {
-                                let c = if other == "rune" {
-                                    t.accent_violet
-                                } else {
-                                    t.accent_cyan
-                                };
-                                ui_components::status_dot(ui, c, 3.5);
+                            ui.add_space(5.0);
+
+                            // `> <prompt>` in crisp blue bold monospace
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
-                                    RichText::new(other)
-                                        .size(11.5)
+                                    RichText::new(">")
+                                        .monospace()
                                         .strong()
-                                        .color(t.text_secondary),
+                                        .size(font_sz)
+                                        .color(t.accent_indigo),
                                 );
-                            });
-                            ui.add_space(2.0);
-                            ui.indent("ai_msg_indent", |ui| {
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(&msg.content)
-                                            .size(12.5)
-                                            .color(t.text_primary),
+                                            .monospace()
+                                            .strong()
+                                            .size(font_sz)
+                                            .color(t.accent_indigo),
                                     )
                                     .wrap(),
                                 );
                             });
+
+                            // Attached image summary line (`▸ [icon] N image(s): ...`)
+                            if !msg.attachments.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        RichText::new("▸")
+                                            .monospace()
+                                            .size(font_sz - 1.0)
+                                            .color(t.text_muted),
+                                    );
+                                    ui_components::icon_image(ui, t.text_muted, 12.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} image(s) ({})",
+                                            msg.attachments.len(),
+                                            msg.attachments.join(", ")
+                                        ))
+                                        .monospace()
+                                        .size(font_sz - 1.0)
+                                        .color(t.text_muted),
+                                    );
+                                });
+                            }
+                            ui.add_space(4.0);
+                        }
+                        "system" => {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("• {}", msg.content))
+                                        .monospace()
+                                        .size(font_sz - 1.0)
+                                        .color(t.text_muted),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        "error" => {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("✗ {}", msg.content))
+                                        .monospace()
+                                        .size(font_sz - 0.5)
+                                        .color(t.accent_rose),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(6.0);
+                        }
+                        _ => {
+                            // Completed thought summary (`▸ Thought for 17.2s, ~188 tokens · model`)
+                            if let Some(meta) = &msg.meta {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("▸ {meta}"))
+                                            .monospace()
+                                            .size(font_sz - 1.0)
+                                            .color(t.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+
+                            // Completed tool activities (`● Edited desktop.rs`, `● Read ai.rs`)
+                            for (verb, detail) in &msg.activities {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui_components::status_dot(ui, t.accent_emerald, 3.5);
+                                    ui.label(
+                                        RichText::new(verb)
+                                            .monospace()
+                                            .strong()
+                                            .size(font_sz - 0.5)
+                                            .color(t.accent_amber),
+                                    );
+                                    if !detail.is_empty() {
+                                        ui.label(
+                                            RichText::new(format!("({detail})"))
+                                                .monospace()
+                                                .size(font_sz - 0.5)
+                                                .color(t.text_secondary),
+                                        );
+                                    }
+                                });
+                            }
+
+                            if msg.meta.is_some() || !msg.activities.is_empty() {
+                                ui.add_space(4.0);
+                            }
+
+                            // Rich monospace markdown-aware rendering (Orca CLI look!)
+                            render_cli_markdown(ui, &t, &msg.content, font_sz);
+                            ui.add_space(8.0);
                         }
                     }
-                    ui.add_space(8.0);
+                }
+
+                // Live streaming status & activities while AI is working (exact Orca / Antigravity CLI style)
+                if self.ai_busy {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(90));
+                    let elapsed = self
+                        .ai_started_at
+                        .map(|s| s.elapsed().as_secs_f32())
+                        .unwrap_or(0.0);
+
+                    // 1. Live Thought line (`○ Thought for 4.2s (...)`)
+                    if let Some(thought) = &self.ai_live_thought {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                            ui.painter().circle_stroke(
+                                r.center(),
+                                3.5,
+                                Stroke::new(1.2, t.text_muted),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "Thought for {elapsed:.1}s ({thought}...)"
+                                    ))
+                                    .monospace()
+                                    .size(font_sz - 1.0)
+                                    .color(t.text_muted),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+
+                    // 2. Live Tool Activities (color-coded by real action: Reading / Editing / Running / Searching)
+                    for (done, verb, detail) in &self.ai_live_activities {
+                        let lower_v = verb.to_lowercase();
+                        let verb_color = if lower_v.starts_with("read") {
+                            t.accent_cyan
+                        } else if lower_v.starts_with("edit") {
+                            t.accent_amber
+                        } else if lower_v.starts_with("run") || lower_v.starts_with("ran") {
+                            t.accent_emerald
+                        } else if lower_v.starts_with("search") {
+                            t.accent_indigo
+                        } else {
+                            t.accent_violet
+                        };
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if *done {
+                                ui_components::status_dot(ui, t.accent_emerald, 3.5);
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(
+                                    Vec2::splat(10.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_stroke(
+                                    r.center(),
+                                    3.5,
+                                    Stroke::new(1.3_f32, verb_color),
+                                );
+                            }
+                            ui.label(
+                                RichText::new(verb)
+                                    .monospace()
+                                    .strong()
+                                    .size(font_sz - 0.5)
+                                    .color(verb_color),
+                            );
+                            if !detail.is_empty() {
+                                ui.label(
+                                    RichText::new(detail)
+                                        .monospace()
+                                        .size(font_sz - 0.5)
+                                        .color(t.text_secondary),
+                                );
+                            }
+                        });
+                    }
+
+                    // 3. Vector-drawn 2x4 animated dot-matrix spinner + real color-coded phase badge
+                    ui.add_space(3.0);
+                    let status_text = if self.ai_status.is_empty() {
+                        "Loading...".to_string()
+                    } else {
+                        self.ai_status.clone()
+                    };
+                    let lower_s = status_text.to_lowercase();
+                    let (phase_label, phase_color) = if lower_s.contains("edit") {
+                        ("Editing", t.accent_amber)
+                    } else if lower_s.contains("read") {
+                        ("Reading", t.accent_cyan)
+                    } else if lower_s.contains("think") {
+                        ("Thinking", t.accent_violet)
+                    } else if lower_s.contains("run") {
+                        ("Running", t.accent_emerald)
+                    } else if lower_s.contains("search") {
+                        ("Searching", t.accent_indigo)
+                    } else if lower_s.contains("writ") {
+                        ("Writing", t.accent_indigo)
+                    } else {
+                        ("Loading", t.text_secondary)
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let (spin_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(10.0, 14.0), egui::Sense::hover());
+                        let p = ui.painter();
+                        let step = ((elapsed * 10.0) as usize) % 8;
+                        let order: [(f32, f32); 8] = [
+                            (0.25, 0.16),
+                            (0.75, 0.16),
+                            (0.75, 0.39),
+                            (0.75, 0.62),
+                            (0.75, 0.85),
+                            (0.25, 0.85),
+                            (0.25, 0.62),
+                            (0.25, 0.39),
+                        ];
+                        for (i, (fx, fy)) in order.iter().enumerate() {
+                            let dist = (step + 8 - i) % 8;
+                            let color = if dist == 0 {
+                                phase_color
+                            } else if dist <= 2 {
+                                t.text_secondary
+                            } else {
+                                t.border_subtle
+                            };
+                            let pt = egui::pos2(
+                                spin_rect.left() + spin_rect.width() * fx,
+                                spin_rect.top() + spin_rect.height() * fy,
+                            );
+                            p.circle_filled(pt, 1.3, color);
+                        }
+                        ui.label(
+                            RichText::new(phase_label)
+                                .monospace()
+                                .strong()
+                                .size(font_sz - 0.5)
+                                .color(phase_color),
+                        );
+                        ui.label(
+                            RichText::new(format!("{status_text} ({elapsed:.1}s)"))
+                                .monospace()
+                                .size(font_sz - 0.5)
+                                .color(t.text_secondary),
+                        );
+                    });
                 }
             });
     }
@@ -1597,7 +2592,8 @@ impl DesktopApp {
         if add_new_tab {
             let id = self.next_term_id;
             self.next_term_id += 1;
-            self.term_tabs.push(TermTab::new(id, self.cwd.clone()));
+            self.term_tabs
+                .push(TermTab::new(id, self.cwd.clone(), self.ctx.clone()));
             self.active_term_idx = self.term_tabs.len() - 1;
         }
         if let Some(idx) = close_idx {
@@ -1610,139 +2606,369 @@ impl DesktopApp {
         }
         if clear_active {
             if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
-                tab.lines.clear();
+                if let Some(pty) = &mut tab.pty {
+                    pty.clear();
+                } else {
+                    tab.lines.clear();
+                }
             }
         }
 
-        // 3. VS Code Terminal Body inside CentralPanel (strictly clipped so it NEVER overlaps sidebar)
-        let mut submit_now = false;
-        let prompt_id = ui.make_persistent_id("vscode_term_inline_input");
+        // 3. Real VS Code-style Interactive PTY Terminal inside CentralPanel
+        let accent = self.accent_color();
+        let term_font_size = self.settings.terminal_font_size.clamp(10.0, 22.0);
+        let ctx_clone = self.ctx.clone();
+        let mut restart_active = false;
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t.bg_code).inner_margin(Margin {
                 left: 0,
-                right: 6,
+                right: 4,
                 top: 2,
                 bottom: 0,
             }))
             .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("bottom_term_scroll")
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 2.0;
+                if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
+                    let exited = tab
+                        .pty
+                        .as_ref()
+                        .and_then(|p| p.exited.lock().ok().map(|g| *g))
+                        .unwrap_or(false);
 
-                        if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
-                            let term_font_size = self.settings.code_font_size.clamp(10.0, 20.0);
-                            for (line, kind) in &tab.lines {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(line)
-                                            .monospace()
-                                            .size(term_font_size)
-                                            .color(kind.color(&t)),
-                                    )
-                                    .wrap(),
-                                );
+                    if let Some(err) = &tab.pty_error {
+                        ui.label(
+                            RichText::new(err)
+                                .monospace()
+                                .size(term_font_size)
+                                .color(t.accent_rose),
+                        );
+                    } else if exited {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(24.0);
+                            ui.label(
+                                RichText::new("Shell session exited")
+                                    .size(13.0)
+                                    .color(t.text_muted),
+                            );
+                            ui.add_space(8.0);
+                            if ui_components::subtle_button(ui, "Restart Shell").clicked() {
+                                restart_active = true;
                             }
-
-                            ui.add_space(4.0);
-                            let user_name =
-                                std::env::var("USER").unwrap_or_else(|_| "user".into());
-                            let short_path = format_git_bash_path(&tab.cwd);
-
-                            // Git Bash 2-line prompt (real user@hostname)
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    RichText::new(format!("{user_name}@{}", self.hostname))
-                                        .monospace()
-                                        .strong()
-                                        .size(term_font_size)
-                                        .color(t.accent_emerald),
-                                );
-                                ui.label(
-                                    RichText::new(&short_path)
-                                        .monospace()
-                                        .size(term_font_size)
-                                        .color(t.accent_amber),
-                                );
-                                if let Some(branch) = &tab.git_branch {
-                                    ui.label(
-                                        RichText::new(format!("({branch})"))
-                                            .monospace()
-                                            .size(term_font_size)
-                                            .color(t.accent_cyan),
-                                    );
-                                }
-                            });
-
-                            // Line 2: $ <typing input>
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    RichText::new("$")
-                                        .monospace()
-                                        .strong()
-                                        .size(term_font_size)
-                                        .color(t.text_primary),
-                                );
-                                if tab.busy {
-                                    ui.spinner();
-                                    ui.label(
-                                        RichText::new("running...")
-                                            .monospace()
-                                            .size(term_font_size - 0.5)
-                                            .color(t.text_muted),
-                                    );
-                                } else {
-                                    let input_w = (ui.available_width() - 4.0).max(60.0);
-                                    let resp = ui.add_sized(
-                                        [input_w, 20.0],
-                                        TextEdit::singleline(&mut tab.input)
-                                            .id(prompt_id)
-                                            .frame(false)
-                                            .font(egui::TextStyle::Monospace)
-                                            .text_color(t.text_primary),
-                                    );
-
-                                    if resp.has_focus() && !tab.history.is_empty() {
-                                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                                            let next = match tab.history_idx {
-                                                None => tab.history.len() - 1,
-                                                Some(i) => i.saturating_sub(1),
-                                            };
-                                            tab.history_idx = Some(next);
-                                            tab.input = tab.history[next].clone();
-                                        } else if ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
-                                        {
-                                            if let Some(i) = tab.history_idx {
-                                                if i + 1 < tab.history.len() {
-                                                    tab.history_idx = Some(i + 1);
-                                                    tab.input = tab.history[i + 1].clone();
-                                                } else {
-                                                    tab.history_idx = None;
-                                                    tab.input.clear();
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if resp.lost_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    {
-                                        submit_now = true;
-                                        resp.request_focus();
-                                    }
-                                }
-                            });
-                        }
-                    });
+                        });
+                    } else if let Some(pty) = &mut tab.pty {
+                        let id_salt = format!("pty_term_tab_{}", tab.id);
+                        pty.render(ui, &t, accent, &id_salt, term_font_size);
+                    }
+                }
             });
 
-        if submit_now {
-            self.run_terminal_cmd(None);
+        if restart_active {
+            if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
+                let cwd = tab.cwd.clone();
+                let id = tab.id;
+                *tab = TermTab::new(id, cwd, ctx_clone);
+            }
+        }
+    }
+}
+
+/// Render AI response text in Orca / Antigravity CLI monospace markdown style:
+/// headings in bold violet, inline `code` in cyan, **bold** in bright white, bullets with `•`, code fences in surface box.
+fn render_cli_markdown(ui: &mut egui::Ui, t: &ThemeColors, text: &str, font_sz: f32) {
+    let mut in_code_block = false;
+    let mut code_buf: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                let block = code_buf.join("\n");
+                code_buf.clear();
+                in_code_block = false;
+                Frame::new()
+                    .fill(t.bg_surface)
+                    .stroke(Stroke::new(1.0, t.border_hairline))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&block)
+                                    .monospace()
+                                    .size(font_sz - 0.5)
+                                    .color(t.accent_cyan),
+                            )
+                            .wrap(),
+                        );
+                    });
+                ui.add_space(3.0);
+            } else {
+                in_code_block = true;
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_buf.push(line);
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            ui.add_space(5.0);
+            continue;
+        }
+
+        // Headings (`### Title`) -> bold violet like Orca CLI
+        if let Some(h) = trimmed
+            .strip_prefix("### ")
+            .or_else(|| trimmed.strip_prefix("## "))
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(h)
+                        .monospace()
+                        .strong()
+                        .size(font_sz)
+                        .color(t.accent_violet),
+                )
+                .wrap(),
+            );
+            continue;
+        }
+
+        // Render line with inline `code` (cyan) and **bold** (bright white) via LayoutJob
+        let indent_spaces = line.len() - trimmed.len();
+        let (prefix, body) = if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let pad = " ".repeat(indent_spaces.min(8));
+            (format!("{pad}• "), rest)
+        } else {
+            (String::new(), line)
+        };
+
+        let mut job = egui::text::LayoutJob::default();
+        let mono_font = egui::FontId::monospace(font_sz);
+
+        if !prefix.is_empty() {
+            job.append(
+                &prefix,
+                0.0,
+                egui::TextFormat {
+                    font_id: mono_font.clone(),
+                    color: t.accent_indigo,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Parse inline `code` and **bold** spans
+        let mut rest = body;
+        while !rest.is_empty() {
+            let next_tick = rest.find('`');
+            let next_bold = rest.find("**");
+            match (next_tick, next_bold) {
+                (Some(ti), Some(bi)) if ti < bi => {
+                    if ti > 0 {
+                        job.append(
+                            &rest[..ti],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let after = &rest[ti + 1..];
+                    if let Some(end) = after.find('`') {
+                        job.append(
+                            &after[..end],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.accent_cyan,
+                                ..Default::default()
+                            },
+                        );
+                        rest = &after[end + 1..];
+                    } else {
+                        job.append(
+                            &rest[ti..],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                        break;
+                    }
+                }
+                (_, Some(bi)) => {
+                    if bi > 0 {
+                        job.append(
+                            &rest[..bi],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let after = &rest[bi + 2..];
+                    if let Some(end) = after.find("**") {
+                        let bold_color = if ui.visuals().dark_mode {
+                            Color32::WHITE
+                        } else {
+                            Color32::BLACK
+                        };
+                        job.append(
+                            &after[..end],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: bold_color,
+                                ..Default::default()
+                            },
+                        );
+                        rest = &after[end + 2..];
+                    } else {
+                        job.append(
+                            &rest[bi..],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                        break;
+                    }
+                }
+                (Some(ti), None) => {
+                    if ti > 0 {
+                        job.append(
+                            &rest[..ti],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    let after = &rest[ti + 1..];
+                    if let Some(end) = after.find('`') {
+                        job.append(
+                            &after[..end],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.accent_cyan,
+                                ..Default::default()
+                            },
+                        );
+                        rest = &after[end + 1..];
+                    } else {
+                        job.append(
+                            &rest[ti..],
+                            0.0,
+                            egui::TextFormat {
+                                font_id: mono_font.clone(),
+                                color: t.text_primary,
+                                ..Default::default()
+                            },
+                        );
+                        break;
+                    }
+                }
+                (None, None) => {
+                    job.append(
+                        rest,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: mono_font.clone(),
+                            color: t.text_primary,
+                            ..Default::default()
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+
+        ui.add(egui::Label::new(job).wrap());
+    }
+}
+
+/// Draw vector-painted Git Commit Graph lanes (`*`, `|`, `/`, `\`) with distinct lane colors.
+fn draw_commit_graph_lanes(ui: &mut egui::Ui, t: &ThemeColors, graph: &str, row_h: f32) {
+    let lane_colors = [
+        t.accent_indigo,
+        t.accent_emerald,
+        t.accent_violet,
+        t.accent_amber,
+        t.accent_cyan,
+        t.accent_rose,
+    ];
+    let chars: Vec<char> = graph.chars().collect();
+    let cell_w = 8.0;
+    let total_w = (chars.len() as f32 * cell_w).max(16.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, row_h), egui::Sense::hover());
+    let p = ui.painter();
+    let y_top = rect.top();
+    let y_mid = rect.center().y;
+    let y_bot = rect.bottom();
+
+    for (idx, ch) in chars.iter().enumerate() {
+        let lane = idx / 2;
+        let color = lane_colors[lane % lane_colors.len()];
+        let cx = rect.left() + (idx as f32 + 0.5) * cell_w;
+        let stroke = Stroke::new(1.8, color);
+
+        match ch {
+            '|' => {
+                p.line_segment([egui::pos2(cx, y_top), egui::pos2(cx, y_bot)], stroke);
+            }
+            '*' => {
+                p.line_segment([egui::pos2(cx, y_top), egui::pos2(cx, y_bot)], stroke);
+                p.circle_filled(egui::pos2(cx, y_mid), 4.0, color);
+                p.circle_stroke(egui::pos2(cx, y_mid), 4.0, Stroke::new(1.2, t.bg_panel));
+            }
+            '/' => {
+                p.line_segment(
+                    [
+                        egui::pos2(cx - cell_w * 0.6, y_bot),
+                        egui::pos2(cx + cell_w * 0.6, y_top),
+                    ],
+                    stroke,
+                );
+            }
+            '\\' => {
+                p.line_segment(
+                    [
+                        egui::pos2(cx - cell_w * 0.6, y_top),
+                        egui::pos2(cx + cell_w * 0.6, y_bot),
+                    ],
+                    stroke,
+                );
+            }
+            '_' | '-' => {
+                p.line_segment(
+                    [
+                        egui::pos2(cx - cell_w * 0.5, y_mid),
+                        egui::pos2(cx + cell_w * 0.5, y_mid),
+                    ],
+                    stroke,
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -2125,25 +3351,54 @@ impl eframe::App for DesktopApp {
 
                         ui.separator();
 
-                        // Group 1 (Left of divider): Workspace Layout
-                        let dock_label = if self.show_bottom_dock {
-                            "Hide Panel"
-                        } else {
-                            "Show Panel"
-                        };
-                        if ui_components::ghost_button(ui, dock_label).clicked() {
-                            self.show_bottom_dock = !self.show_bottom_dock;
+                        // Group 1 (Left of divider): Independent Workspace Panel Toggles (Diff | AI | Terminal)
+                        if ui_components::panel_toggle_button(
+                            ui,
+                            "Terminal",
+                            self.show_terminal_panel,
+                            accent,
+                        )
+                        .on_hover_text("เปิด/ปิดหน้าต่าง Terminal")
+                        .clicked()
+                        {
+                            self.show_terminal_panel = !self.show_terminal_panel;
+                            self.persist_ui_state();
+                        }
+                        if ui_components::panel_toggle_button(
+                            ui,
+                            "AI",
+                            self.show_ai_panel,
+                            accent,
+                        )
+                        .on_hover_text("เปิด/ปิดหน้าต่าง AI")
+                        .clicked()
+                        {
+                            self.show_ai_panel = !self.show_ai_panel;
+                            self.persist_ui_state();
+                        }
+                        if ui_components::panel_toggle_button(
+                            ui,
+                            "Diff",
+                            self.show_diff_preview,
+                            accent,
+                        )
+                        .on_hover_text("เปิด/ปิดหน้าต่าง Diff Preview")
+                        .clicked()
+                        {
+                            self.show_diff_preview = !self.show_diff_preview;
+                            self.persist_ui_state();
                         }
                     });
                 });
             });
 
-        // 2. Bottom Dock: Smooth Proportional Split — AI Prompt (Left) | Centered Drag Handle | Terminal (Right)
-        if self.show_bottom_dock {
+        // 2. Bottom Dock (only docked at bottom when Diff Preview is visible; otherwise fills CentralPanel)
+        let show_any_bottom = self.show_ai_panel || self.show_terminal_panel;
+        if self.show_diff_preview && show_any_bottom {
             let max_dock_h = (ctx.screen_rect().height() * 0.72).max(240.0);
             let dock_frame = Frame::new()
                 .fill(canvas_bg)
-                .stroke(Stroke::new(1.0, t.border_hairline))
+                .stroke(Stroke::new(1.0_f32, t.border_hairline))
                 .inner_margin(Margin::same(10));
 
             egui::TopBottomPanel::bottom("bottom_dock_v2")
@@ -2152,113 +3407,13 @@ impl eframe::App for DesktopApp {
                 .default_height(300.0)
                 .height_range(200.0..=max_dock_h)
                 .show(ctx, |ui| {
-                    let full_rect = ui.available_rect_before_wrap();
-                    // Reserve full_rect in parent ui so TopBottomPanel preserves its height & resizes smoothly
-                    ui.allocate_rect(full_rect, egui::Sense::hover());
-
-                    let gap = 10.0;
-                    let total_w = (full_rect.width() - gap).max(300.0);
-                    let min_pane_w = 220.0f32.min(total_w * 0.35);
-
-                    let left_w = (total_w * self.bottom_split_ratio)
-                        .clamp(min_pane_w, (total_w - min_pane_w).max(min_pane_w));
-                    let right_w = (total_w - left_w).max(min_pane_w);
-
-                    let left_rect = egui::Rect::from_min_size(
-                        full_rect.min,
-                        Vec2::new(left_w, full_rect.height()),
-                    );
-                    let handle_rect = egui::Rect::from_min_size(
-                        egui::pos2(left_rect.max.x, full_rect.min.y),
-                        Vec2::new(gap, full_rect.height()),
-                    );
-                    let right_rect = egui::Rect::from_min_size(
-                        egui::pos2(handle_rect.max.x, full_rect.min.y),
-                        Vec2::new(right_w, full_rect.height()),
-                    );
-
-                    // Left Pane: AI CHAT
-                    let mut left_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(left_rect)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-                    left_ui.set_clip_rect(left_rect);
-                    Frame::new()
-                        .fill(panel_bg)
-                        .stroke(Stroke::new(1.0, t.border_hairline))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::same(12))
-                        .show(&mut left_ui, |ui| {
-                            ui.set_min_size(Vec2::new(
-                                (left_w - 24.0).max(80.0),
-                                (full_rect.height() - 24.0).max(80.0),
-                            ));
-                            ui.set_max_width((left_w - 24.0).max(80.0));
-                            self.render_bottom_prompt(ui);
-                        });
-
-                    // Centered Draggable Split Handle between AI CHAT and TERMINAL
-                    let handle_resp = ui
-                        .interact(
-                            handle_rect,
-                            ui.make_persistent_id("bottom_split_handle"),
-                            egui::Sense::drag(),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
-
-                    if handle_resp.dragged() {
-                        if let Some(pointer) = ctx.pointer_interact_pos() {
-                            let new_left = (pointer.x - full_rect.min.x - gap * 0.5)
-                                .clamp(min_pane_w, total_w - min_pane_w);
-                            self.bottom_split_ratio = (new_left / total_w).clamp(0.15, 0.85);
-                        }
-                    }
-
-                    // Draw subtle centered grip pill inside the gap (highlights on hover/drag)
-                    let grip_color = if handle_resp.dragged() {
-                        accent
-                    } else if handle_resp.hovered() {
-                        t.text_secondary
-                    } else {
-                        t.border_subtle
-                    };
-                    let grip_h = if handle_resp.hovered() || handle_resp.dragged() {
-                        48.0
-                    } else {
-                        28.0
-                    };
-                    let grip_rect = egui::Rect::from_center_size(
-                        handle_rect.center(),
-                        Vec2::new(3.0, grip_h),
-                    );
-                    ui.painter()
-                        .rect_filled(grip_rect, CornerRadius::same(2), grip_color);
-
-                    // Right Pane: TERMINAL
-                    let mut right_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(right_rect)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-                    right_ui.set_clip_rect(right_rect);
-                    Frame::new()
-                        .fill(t.bg_code)
-                        .stroke(Stroke::new(1.0, t.border_hairline))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::same(12))
-                        .show(&mut right_ui, |ui| {
-                            ui.set_min_size(Vec2::new(
-                                (right_w - 24.0).max(80.0),
-                                (full_rect.height() - 24.0).max(80.0),
-                            ));
-                            ui.set_max_width((right_w - 24.0).max(80.0));
-                            self.render_bottom_terminal(ui);
-                        });
+                    self.render_ai_and_terminal_area(ctx, ui, &t, accent);
                 });
         }
 
-        // 3. Left Sidebar: Orca-Style Changed Files
+        // 3. Diff Workspace (Left Sidebar + Central Diff Preview) — or Full-Height AI/Terminal when Diff is hidden
+        if self.show_diff_preview {
+        // Left Sidebar: Orca-Style Changed Files & Commit Graph
         let sidebar_frame = Frame::new()
             .fill(panel_bg)
             .stroke(Stroke::new(1.0, t.border_hairline))
@@ -2267,148 +3422,375 @@ impl eframe::App for DesktopApp {
         egui::SidePanel::left("orca_files_sidebar")
             .frame(sidebar_frame)
             .resizable(true)
-            .default_width(275.0)
-            .min_width(210.0)
+            .default_width(290.0)
+            .min_width(220.0)
             .show(ctx, |ui| {
-                let total_add: usize = self.changes.iter().map(|c| c.added).sum();
-                let total_del: usize = self.changes.iter().map(|c| c.removed).sum();
-
+                // Top Row: Segmented Toggle (Changes | Graph) + Refresh
                 ui.horizontal(|ui| {
-                    ui_components::section_title(ui, "CHANGED FILES", t.accent_amber);
-                    ui_components::pill(ui, &format!("{}", self.changes.len()), t.text_primary, t.bg_surface);
+                    ui_components::segmented_toggle(
+                        ui,
+                        &mut self.sidebar_tab,
+                        &[
+                            (SidebarTab::Changes, "Changes"),
+                            (SidebarTab::Graph, "Graph"),
+                        ],
+                        accent,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui_components::ghost_button(ui, "Refresh")
-                            .on_hover_text("รีเฟรชรายการไฟล์ที่แก้ไขและ Git Diff")
+                            .on_hover_text("รีเฟรชรายการไฟล์ที่แก้ไขและเส้น Commit")
                             .clicked()
                         {
                             self.refresh_changes();
                         }
-                        ui.label(
-                            RichText::new(format!("-{total_del}"))
-                                .size(11.5)
-                                .monospace()
-                                .color(t.accent_rose),
-                        );
-                        ui.label(
-                            RichText::new(format!("+{total_add}"))
-                                .size(11.5)
-                                .monospace()
-                                .color(t.accent_emerald),
-                        );
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
-                // Clean Filter Input
-                Frame::new()
-                    .fill(t.bg_code)
-                    .stroke(Stroke::new(1.0, t.border_hairline))
-                    .corner_radius(CornerRadius::same(7))
-                    .inner_margin(Margin::symmetric(9, 6))
-                    .show(ui, |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), 18.0],
-                            TextEdit::singleline(&mut self.file_filter)
-                                .frame(false)
-                                .hint_text("Filter files..."),
-                        );
-                    });
+                match self.sidebar_tab {
+                    SidebarTab::Changes => {
+                        let total_add: usize = self.changes.iter().map(|c| c.added).sum();
+                        let total_del: usize = self.changes.iter().map(|c| c.removed).sum();
 
-                ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui_components::section_title(ui, "CHANGED FILES", t.accent_amber);
+                            ui_components::pill(
+                                ui,
+                                &format!("{}", self.changes.len()),
+                                t.text_primary,
+                                t.bg_surface,
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("-{total_del}"))
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(t.accent_rose),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("+{total_add}"))
+                                            .size(11.5)
+                                            .monospace()
+                                            .color(t.accent_emerald),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt("orca_file_list_scroll")
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        let filter_lower = self.file_filter.to_lowercase();
-                        let mut shown = 0;
+                        // Clean Filter Input
+                        Frame::new()
+                            .fill(t.bg_code)
+                            .stroke(Stroke::new(1.0, t.border_hairline))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(Margin::symmetric(9, 6))
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), 18.0],
+                                    TextEdit::singleline(&mut self.file_filter)
+                                        .frame(false)
+                                        .hint_text("Filter files..."),
+                                );
+                            });
 
-                        for (idx, change) in self.changes.iter().enumerate() {
-                            if !filter_lower.is_empty()
-                                && !change.path.to_lowercase().contains(&filter_lower)
-                            {
-                                continue;
-                            }
-                            shown += 1;
+                        ui.add_space(8.0);
 
-                            let selected = idx == self.selected_change_idx;
-                            let bg = if selected { t.bg_surface } else { Color32::TRANSPARENT };
-                            let stroke = if selected {
-                                Stroke::new(1.0, accent)
-                            } else {
-                                Stroke::NONE
-                            };
+                        egui::ScrollArea::vertical()
+                            .id_salt("orca_file_list_scroll")
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let filter_lower = self.file_filter.to_lowercase();
+                                let mut shown = 0;
 
-                            let (st_fg, st_bg) = ui_components::status_colors(&t, &change.status);
+                                for (idx, change) in self.changes.iter().enumerate() {
+                                    if !filter_lower.is_empty()
+                                        && !change.path.to_lowercase().contains(&filter_lower)
+                                    {
+                                        continue;
+                                    }
+                                    shown += 1;
 
-                            let resp = Frame::new()
-                                .fill(bg)
-                                .stroke(stroke)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(7, 4))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui_components::pill(ui, &change.status, st_fg, st_bg);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&change.path)
-                                                    .size(12.5)
-                                                    .color(if selected {
-                                                        t.text_primary
-                                                    } else {
-                                                        t.text_secondary
-                                                    }),
-                                            )
-                                            .truncate(),
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(2.0);
+                                    let selected = idx == self.selected_change_idx;
+                                    let bg = if selected {
+                                        t.bg_surface
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    let stroke = if selected {
+                                        Stroke::new(1.0, accent)
+                                    } else {
+                                        Stroke::NONE
+                                    };
+
+                                    let (st_fg, _) =
+                                        ui_components::status_colors(&t, &change.status);
+
+                                    let resp = Frame::new()
+                                        .fill(bg)
+                                        .stroke(stroke)
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(7, 4))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(&change.status)
+                                                        .monospace()
+                                                        .strong()
+                                                        .size(11.5)
+                                                        .color(st_fg),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&change.path)
+                                                            .size(12.5)
+                                                            .color(if selected {
+                                                                t.text_primary
+                                                            } else {
+                                                                t.text_secondary
+                                                            }),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(2.0);
+                                                ui.label(
+                                                    RichText::new(format!("+{}", change.added))
+                                                        .size(11.0)
+                                                        .monospace()
+                                                        .color(t.accent_emerald),
+                                                );
+                                                ui.label(
+                                                    RichText::new(format!("-{}", change.removed))
+                                                        .size(11.0)
+                                                        .monospace()
+                                                        .color(t.accent_rose),
+                                                );
+                                            });
+                                        })
+                                        .response
+                                        .interact(egui::Sense::click());
+
+                                    if resp.clicked() {
+                                        self.selected_change_idx = idx;
+                                    }
+                                }
+
+                                if shown == 0 {
+                                    ui.add_space(24.0);
+                                    ui.vertical_centered(|ui| {
                                         ui.label(
-                                            RichText::new(format!("+{}", change.added))
-                                                .size(11.0)
-                                                .monospace()
+                                            RichText::new("Working tree clean")
+                                                .size(13.0)
                                                 .color(t.accent_emerald),
                                         );
                                         ui.label(
-                                            RichText::new(format!("-{}", change.removed))
-                                                .size(11.0)
-                                                .monospace()
-                                                .color(t.accent_rose),
+                                            RichText::new("ยังไม่มีไฟล์ที่ถูกแก้ไข")
+                                                .size(11.5)
+                                                .color(t.text_muted),
                                         );
                                     });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
+                                }
+                            });
+                    }
+                    SidebarTab::Graph => {
+                        let commit_count =
+                            self.commit_graph.iter().filter(|r| !r.hash.is_empty()).count();
+                        ui.horizontal(|ui| {
+                            ui_components::section_title(ui, "COMMIT GRAPH", t.accent_violet);
+                            ui_components::pill(
+                                ui,
+                                &format!("{commit_count}"),
+                                t.text_primary,
+                                t.bg_surface,
+                            );
+                        });
+                        ui.add_space(8.0);
 
-                            if resp.clicked() {
-                                self.selected_change_idx = idx;
-                            }
-                        }
-
-                        if shown == 0 {
-                            ui.add_space(24.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    RichText::new("✓ Working tree clean")
-                                        .size(13.0)
-                                        .color(t.accent_emerald),
-                                );
-                                ui.label(
-                                    RichText::new("ยังไม่มีไฟล์ที่ถูกแก้ไข")
-                                        .size(11.5)
-                                        .color(t.text_muted),
+                        // Filter commits by message / hash / author / branch ref
+                        Frame::new()
+                            .fill(t.bg_code)
+                            .stroke(Stroke::new(1.0, t.border_hairline))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(Margin::symmetric(9, 6))
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), 18.0],
+                                    TextEdit::singleline(&mut self.file_filter)
+                                        .frame(false)
+                                        .hint_text("Filter commits..."),
                                 );
                             });
+
+                        ui.add_space(8.0);
+
+                        let mut clicked_commit: Option<String> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("orca_commit_graph_scroll")
+                            .show(ui, |ui| {
+                                // Zero vertical spacing so graph lane lines connect cleanly across rows
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                let filter_lower = self.file_filter.to_lowercase();
+                                let mut shown = 0;
+
+                                for row in &self.commit_graph {
+                                    // Pure graph connector row (e.g. `|\`, `|/`)
+                                    if row.hash.is_empty() {
+                                        if filter_lower.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(6.0);
+                                                draw_commit_graph_lanes(ui, &t, &row.graph, 14.0);
+                                            });
+                                        }
+                                        continue;
+                                    }
+
+                                    if !filter_lower.is_empty() {
+                                        let matches = row
+                                            .subject
+                                            .to_lowercase()
+                                            .contains(&filter_lower)
+                                            || row.hash.to_lowercase().contains(&filter_lower)
+                                            || row.author.to_lowercase().contains(&filter_lower)
+                                            || row
+                                                .refs
+                                                .iter()
+                                                .any(|r| r.to_lowercase().contains(&filter_lower));
+                                        if !matches {
+                                            continue;
+                                        }
+                                    }
+                                    shown += 1;
+
+                                    let selected = self.selected_commit_hash.as_deref()
+                                        == Some(row.hash.as_str());
+                                    let bg = if selected {
+                                        t.bg_surface
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+                                    let stroke = if selected {
+                                        Stroke::new(1.0, accent)
+                                    } else {
+                                        Stroke::NONE
+                                    };
+
+                                    let resp = Frame::new()
+                                        .fill(bg)
+                                        .stroke(stroke)
+                                        .corner_radius(CornerRadius::same(6))
+                                        .inner_margin(Margin::symmetric(6, 0))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            ui.horizontal(|ui| {
+                                                draw_commit_graph_lanes(ui, &t, &row.graph, 42.0);
+                                                ui.add_space(4.0);
+                                                ui.vertical(|ui| {
+                                                    ui.add_space(4.0);
+                                                    // Line 1: Ref pills + Commit subject
+                                                    ui.horizontal(|ui| {
+                                                        if !row.refs.is_empty() {
+                                                            for r in row.refs.iter().take(2) {
+                                                                let r = r.trim();
+                                                                if r.is_empty() {
+                                                                    continue;
+                                                                }
+                                                                let (fg, rbg) = if r.contains("HEAD")
+                                                                {
+                                                                    (t.accent_emerald, t.diff_add_bg)
+                                                                } else if r.starts_with("tag:") {
+                                                                    (t.accent_amber, t.bg_code)
+                                                                } else {
+                                                                    (t.accent_violet, t.bg_code)
+                                                                };
+                                                                let short_ref =
+                                                                    r.trim_start_matches("HEAD -> ");
+                                                                ui_components::pill(
+                                                                    ui, short_ref, fg, rbg,
+                                                                );
+                                                            }
+                                                        }
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&row.subject)
+                                                                    .size(12.0)
+                                                                    .color(if selected {
+                                                                        t.text_primary
+                                                                    } else {
+                                                                        t.text_secondary
+                                                                    }),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                                    ui.add_space(2.0);
+                                                    // Line 2: short hash · author · relative date
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new(&row.hash)
+                                                                .monospace()
+                                                                .size(10.5)
+                                                                .color(t.accent_indigo),
+                                                        );
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(format!(
+                                                                    "{} · {}",
+                                                                    row.author, row.date
+                                                                ))
+                                                                .size(10.5)
+                                                                .color(t.text_muted),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                                    ui.add_space(4.0);
+                                                });
+                                            });
+                                        })
+                                        .response
+                                        .interact(egui::Sense::click())
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                                    if resp.clicked() {
+                                        clicked_commit = Some(row.hash.clone());
+                                    }
+                                }
+
+                                if shown == 0 {
+                                    ui.add_space(24.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            RichText::new("No commits found")
+                                                .size(13.0)
+                                                .color(t.text_secondary),
+                                        );
+                                        ui.label(
+                                            RichText::new("ยังไม่มีประวัติ Git Commit ในโปรเจกต์นี้")
+                                                .size(11.5)
+                                                .color(t.text_muted),
+                                        );
+                                    });
+                                }
+                            });
+
+                        if let Some(hash) = clicked_commit {
+                            self.select_commit(hash);
                         }
-                    });
+                    }
+                }
             });
 
         // 4. Center Main Area: Seamless Orca Diff Card (Header + Code Joined)
         let center_frame = Frame::new()
             .fill(canvas_bg)
             .inner_margin(Margin::same(12));
+
+        let viewing_commit =
+            self.sidebar_tab == SidebarTab::Graph && self.selected_commit_hash.is_some();
 
         egui::CentralPanel::default()
             .frame(center_frame)
@@ -2433,12 +3815,34 @@ impl eframe::App for DesktopApp {
                             .inner_margin(Margin::symmetric(14, 10))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    if let Some(change) =
+                                    let active_change = if viewing_commit {
+                                        self.selected_commit_changes
+                                            .get(self.selected_commit_file_idx)
+                                    } else {
                                         self.changes.get(self.selected_change_idx)
-                                    {
-                                        let (st_fg, st_bg) =
+                                    };
+
+                                    if viewing_commit {
+                                        if let Some(hash) = &self.selected_commit_hash {
+                                            ui_components::pill(
+                                                ui,
+                                                hash,
+                                                t.accent_violet,
+                                                t.bg_surface,
+                                            );
+                                        }
+                                    }
+
+                                    if let Some(change) = active_change {
+                                        let (st_fg, _) =
                                             ui_components::status_colors(&t, &change.status);
-                                        ui_components::pill(ui, &change.status, st_fg, st_bg);
+                                        ui.label(
+                                            RichText::new(&change.status)
+                                                .monospace()
+                                                .strong()
+                                                .size(12.5)
+                                                .color(st_fg),
+                                        );
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(&change.path)
@@ -2463,8 +3867,13 @@ impl eframe::App for DesktopApp {
                                             t.diff_del_bg,
                                         );
                                     } else {
+                                        let title = if self.sidebar_tab == SidebarTab::Graph {
+                                            "Commit Diff Preview"
+                                        } else {
+                                            "Diff Preview"
+                                        };
                                         ui.label(
-                                            RichText::new("Diff Preview")
+                                            RichText::new(title)
                                                 .strong()
                                                 .size(13.5)
                                                 .color(t.text_secondary),
@@ -2489,6 +3898,84 @@ impl eframe::App for DesktopApp {
                                 });
                             });
 
+                        // If viewing a commit with multiple changed files, show a compact file selector bar
+                        if viewing_commit && self.selected_commit_changes.len() > 1 {
+                            ui.separator();
+                            let mut next_file_idx: Option<usize> = None;
+                            Frame::new()
+                                .fill(panel_bg)
+                                .inner_margin(Margin::symmetric(12, 6))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt("commit_files_strip")
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                for (i, ch) in
+                                                    self.selected_commit_changes.iter().enumerate()
+                                                {
+                                                    let is_sel =
+                                                        i == self.selected_commit_file_idx;
+                                                    let (st_fg, _) = ui_components::status_colors(
+                                                        &t,
+                                                        &ch.status,
+                                                    );
+                                                    let short_name = ch
+                                                        .path
+                                                        .rsplit('/')
+                                                        .next()
+                                                        .unwrap_or(&ch.path);
+                                                    let resp = Frame::new()
+                                                        .fill(if is_sel {
+                                                            t.bg_surface
+                                                        } else {
+                                                            Color32::TRANSPARENT
+                                                        })
+                                                        .stroke(if is_sel {
+                                                            Stroke::new(1.0, accent)
+                                                        } else {
+                                                            Stroke::new(1.0, t.border_hairline)
+                                                        })
+                                                        .corner_radius(CornerRadius::same(6))
+                                                        .inner_margin(Margin::symmetric(8, 3))
+                                                        .show(ui, |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    RichText::new(&ch.status)
+                                                                        .monospace()
+                                                                        .strong()
+                                                                        .size(11.0)
+                                                                        .color(st_fg),
+                                                                );
+                                                                ui.label(
+                                                                    RichText::new(short_name)
+                                                                        .monospace()
+                                                                        .size(11.5)
+                                                                        .color(if is_sel {
+                                                                            t.text_primary
+                                                                        } else {
+                                                                            t.text_secondary
+                                                                        }),
+                                                                );
+                                                            });
+                                                        })
+                                                        .response
+                                                        .interact(egui::Sense::click())
+                                                        .on_hover_text(&ch.path)
+                                                        .on_hover_cursor(
+                                                            egui::CursorIcon::PointingHand,
+                                                        );
+                                                    if resp.clicked() {
+                                                        next_file_idx = Some(i);
+                                                    }
+                                                }
+                                            });
+                                        });
+                                });
+                            if let Some(i) = next_file_idx {
+                                self.selected_commit_file_idx = i;
+                            }
+                        }
+
                         ui.separator();
 
                         // Diff Code Body
@@ -2498,33 +3985,101 @@ impl eframe::App for DesktopApp {
                             egui::ScrollArea::both().id_salt("orca_diff_scroll_xy")
                         };
                         diff_scroll.show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.add_space(4.0);
-                                if let Some(change) = self.changes.get(self.selected_change_idx) {
-                                    self.render_orca_diff(ui, change);
-                                } else {
-                                    ui.add_space(60.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new("No file selected")
-                                                .size(15.0)
-                                                .strong()
-                                                .color(t.text_secondary),
-                                        );
-                                        ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new(
-                                                "เลือกไฟล์จากแถบ CHANGED FILES ด้านซ้ายเพื่อดู Diff",
-                                            )
+                            ui.set_min_width(ui.available_width());
+                            ui.add_space(4.0);
+                            let active_change = if viewing_commit {
+                                self.selected_commit_changes
+                                    .get(self.selected_commit_file_idx)
+                            } else if self.sidebar_tab == SidebarTab::Graph {
+                                None
+                            } else {
+                                self.changes.get(self.selected_change_idx)
+                            };
+
+                            if let Some(change) = active_change {
+                                self.render_orca_diff(ui, change);
+                            } else {
+                                ui.add_space(60.0);
+                                ui.vertical_centered(|ui| {
+                                    let (heading, subtitle) = if viewing_commit {
+                                        (
+                                            "No file changes in this commit",
+                                            "Commit นี้ไม่มีไฟล์ที่เปลี่ยนแปลง (เช่น merge commit หรือ empty commit)",
+                                        )
+                                    } else if self.sidebar_tab == SidebarTab::Graph {
+                                        (
+                                            "No commit selected",
+                                            "เลือก commit จากแถบ COMMIT GRAPH ด้านซ้ายเพื่อดูรายละเอียด Diff",
+                                        )
+                                    } else {
+                                        (
+                                            "No file selected",
+                                            "เลือกไฟล์จากแถบ CHANGED FILES ด้านซ้ายเพื่อดู Diff",
+                                        )
+                                    };
+                                    ui.label(
+                                        RichText::new(heading)
+                                            .size(15.0)
+                                            .strong()
+                                            .color(t.text_secondary),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new(subtitle)
                                             .size(12.5)
                                             .color(t.text_muted),
-                                        );
-                                    });
-                                }
-                                ui.add_space(12.0);
-                            });
+                                    );
+                                });
+                            }
+                            ui.add_space(12.0);
+                        });
                     });
             });
+        } else {
+            let full_frame = Frame::new()
+                .fill(canvas_bg)
+                .inner_margin(Margin::same(10));
+            egui::CentralPanel::default()
+                .frame(full_frame)
+                .show(ctx, |ui| {
+                    if show_any_bottom {
+                        self.render_ai_and_terminal_area(ctx, ui, &t, accent);
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space((ui.available_height() * 0.35).max(40.0));
+                                ui.label(
+                                    RichText::new("ปิดหน้าต่างทั้งหมดอยู่")
+                                        .size(16.0)
+                                        .strong()
+                                        .color(t.text_secondary),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("กดปุ่มด้านบนหรือเลือกเปิดหน้าต่างที่ต้องการด้านล่าง")
+                                        .size(12.5)
+                                        .color(t.text_muted),
+                                );
+                                ui.add_space(14.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(((ui.available_width() - 250.0) * 0.5).max(0.0));
+                                    if ui_components::subtle_button(ui, "เปิด Diff Preview")
+                                        .clicked()
+                                    {
+                                        self.show_diff_preview = true;
+                                    }
+                                    if ui_components::subtle_button(ui, "เปิด AI").clicked() {
+                                        self.show_ai_panel = true;
+                                    }
+                                    if ui_components::subtle_button(ui, "เปิด Terminal").clicked() {
+                                        self.show_terminal_panel = true;
+                                    }
+                                });
+                            });
+                        });
+                    }
+                });
+        }
 
         // 5. Modal Dialog: Create New Branch from Current Branch
         if self.show_new_branch_modal {
@@ -2630,8 +4185,8 @@ impl eframe::App for DesktopApp {
             let mut reset_clicked = false;
 
             let screen = ctx.screen_rect();
-            let modal_w = (screen.width() - 40.0).min(500.0).max(320.0);
-            let modal_h = (screen.height() - 40.0).min(355.0).max(260.0);
+            let modal_w = (screen.width() - 40.0).min(520.0).max(340.0);
+            let modal_h = (screen.height() - 40.0).min(460.0).max(320.0);
 
             egui::Window::new("Settings")
                 .title_bar(false)
@@ -2702,14 +4257,82 @@ impl eframe::App for DesktopApp {
                                     ui.end_row();
 
                                     ui.label(
-                                        RichText::new("Code Font Size")
+                                        RichText::new("Font Family")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    let prev_font = self.settings.font_family.clone();
+                                    let current_font_label = if self.settings.font_family.is_empty()
+                                    {
+                                        "Default".to_string()
+                                    } else {
+                                        self.settings.font_family.clone()
+                                    };
+                                    egui::ComboBox::from_id_salt("settings_font_family")
+                                        .selected_text(&current_font_label)
+                                        .width(240.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.settings.font_family,
+                                                "Default".to_string(),
+                                                "Default",
+                                            );
+                                            for (name, _) in &self.system_fonts {
+                                                ui.selectable_value(
+                                                    &mut self.settings.font_family,
+                                                    name.clone(),
+                                                    name,
+                                                );
+                                            }
+                                        });
+                                    if self.settings.font_family != prev_font {
+                                        setup_fonts(
+                                            ctx,
+                                            &self.settings.font_family,
+                                            &self.system_fonts,
+                                        );
+                                    }
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Diff Font Size")
                                             .size(12.5)
                                             .color(t.text_secondary),
                                     );
                                     ui.add(
                                         egui::Slider::new(
-                                            &mut self.settings.code_font_size,
-                                            10.0..=20.0,
+                                            &mut self.settings.diff_font_size,
+                                            10.0..=22.0,
+                                        )
+                                        .step_by(0.5)
+                                        .suffix(" px"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("AI Font Size")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.settings.ai_font_size,
+                                            10.0..=22.0,
+                                        )
+                                        .step_by(0.5)
+                                        .suffix(" px"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Terminal Font Size")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.settings.terminal_font_size,
+                                            10.0..=22.0,
                                         )
                                         .step_by(0.5)
                                         .suffix(" px"),
@@ -2911,26 +4534,40 @@ impl eframe::App for DesktopApp {
                     });
                 });
 
-            if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.show_settings_modal = false;
-            }
             if reset_clicked {
                 self.settings = AppSettings::default();
                 self.dark_mode = self.settings.dark_mode;
+                self.show_diff_preview = self.settings.show_diff_preview;
+                self.show_ai_panel = self.settings.show_ai_panel;
+                self.show_terminal_panel = self.settings.show_terminal_panel;
                 ui_components::apply_theme(ctx, self.dark_mode);
-                self.settings_status = Some("รีเซ็ตเป็นค่าเริ่มต้นแล้ว (กด Save เพื่อบันทึก)".into());
+                setup_fonts(ctx, &self.settings.font_family, &self.system_fonts);
+                let _ = self.settings.save();
+                self.settings_status = Some("รีเซ็ตเป็นค่าเริ่มต้นและบันทึกแล้ว".into());
             }
             if save_clicked {
                 self.settings.dark_mode = self.dark_mode;
+                self.settings.selected_provider_id = self.selected_provider_id.clone();
+                self.settings.selected_base_model = self.selected_base_model.clone();
+                self.settings.selected_level = self.selected_level.clone();
+                self.settings.selected_agent = self.selected_agent.clone();
+                self.settings.show_diff_preview = self.show_diff_preview;
+                self.settings.show_ai_panel = self.show_ai_panel;
+                self.settings.show_terminal_panel = self.show_terminal_panel;
                 match self.settings.save() {
                     Ok(path) => {
                         self.settings_status =
                             Some(format!("บันทึกแล้วที่ {}", path.display()));
+                        self.show_settings_modal = false;
                     }
                     Err(e) => {
                         self.settings_status = Some(format!("บันทึกไม่สำเร็จ: {e}"));
                     }
                 }
+            } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.settings.dark_mode = self.dark_mode;
+                self.persist_ui_state();
+                self.show_settings_modal = false;
             }
         }
     }

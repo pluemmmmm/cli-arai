@@ -7,7 +7,11 @@ use std::path::PathBuf;
 pub struct AppSettings {
     // Appearance & Editor
     pub dark_mode: bool,
+    pub font_family: String, // "Default" or installed system font name
     pub code_font_size: f32,
+    pub diff_font_size: f32,
+    pub ai_font_size: f32,
+    pub terminal_font_size: f32,
     pub auto_refresh_diff: bool,
     pub auto_refresh_secs: u64,
     pub word_wrap_diff: bool,
@@ -16,6 +20,15 @@ pub struct AppSettings {
     pub execution_mode: String, // "auto" | "accept-edits" | "plan"
     pub system_instruction: String,
     pub request_timeout_secs: u64,
+    pub selected_provider_id: Option<String>,
+    pub selected_base_model: String,
+    pub selected_level: Option<String>,
+    pub selected_agent: String,
+
+    // Workspace Layout
+    pub show_diff_preview: bool,
+    pub show_ai_panel: bool,
+    pub show_terminal_panel: bool,
 
     // Terminal
     pub shell: String, // "zsh" | "bash" | "sh"
@@ -26,13 +39,24 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dark_mode: true,
+            font_family: "Default".to_string(),
             code_font_size: 12.5,
+            diff_font_size: 12.5,
+            ai_font_size: 12.5,
+            terminal_font_size: 12.5,
             auto_refresh_diff: true,
             auto_refresh_secs: 2,
             word_wrap_diff: true,
             execution_mode: "auto".to_string(),
             system_instruction: String::new(),
             request_timeout_secs: 0,
+            selected_provider_id: None,
+            selected_base_model: String::new(),
+            selected_level: None,
+            selected_agent: "Default".to_string(),
+            show_diff_preview: true,
+            show_ai_panel: true,
+            show_terminal_panel: true,
             shell: "zsh".to_string(),
             max_terminal_lines: 500,
         }
