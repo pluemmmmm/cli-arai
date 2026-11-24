@@ -39,3 +39,13 @@ cargo run -- run examples/hello.rn
 # 6. เปิดโหมด Rune REPL
 cargo run -- repl
 ```
+
+### รันแบบ Auto-reload ระหว่างพัฒนา (Hot Reload)
+
+หากต้องการให้โปรแกรมรีสตาร์ทอัตโนมัติเมื่อแก้ไขไฟล์ใน `src` หรือ `Cargo.toml` สามารถใช้ `watchexec` ได้:
+
+```bash
+watchexec -r -w src -w Cargo.toml -- cargo run
+```
+
+> หากยังไม่ได้ติดตั้ง `watchexec` สามารถติดตั้งได้ด้วย `brew install watchexec` หรือ `cargo install watchexec-cli`

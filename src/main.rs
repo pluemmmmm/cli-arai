@@ -2,6 +2,7 @@ mod ai;
 mod changes;
 mod config_rune;
 mod desktop;
+mod pty_terminal;
 mod rune_engine;
 mod settings;
 mod tui;

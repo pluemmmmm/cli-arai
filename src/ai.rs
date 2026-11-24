@@ -3,7 +3,20 @@ use serde_json::json;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+#[derive(Debug, Clone)]
+pub enum AiStreamEvent {
+    Status(String),
+    Thought(String),
+    ConversationId(String),
+    Activity {
+        done: bool,
+        verb: String,
+        detail: String,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -65,6 +78,9 @@ pub struct AiRequestOptions {
     pub system_instruction: Option<String>,
     pub timeout_secs: u64,
     pub attachments: Vec<PathBuf>,
+    pub continue_conversation: bool,
+    pub conversation_id: Option<String>,
+    pub working_dir: Option<PathBuf>,
 }
 
 impl Default for AiRequestOptions {
@@ -77,6 +93,9 @@ impl Default for AiRequestOptions {
             system_instruction: None,
             timeout_secs: 0,
             attachments: Vec::new(),
+            continue_conversation: false,
+            conversation_id: None,
+            working_dir: None,
         }
     }
 }
@@ -523,6 +542,545 @@ pub fn select_provider<'a>(
 /// Send a prompt to the chosen AI provider with default options.
 pub async fn ask_provider(provider: &AiProvider, prompt: &str) -> Result<String> {
     ask_provider_with_options(provider, prompt, &AiRequestOptions::default()).await
+}
+
+/// Send a prompt with real-time streaming progress events (Loading / Thinking / Reading / Editing / Running).
+pub async fn ask_provider_streaming<F>(
+    provider: &AiProvider,
+    prompt: &str,
+    opts: &AiRequestOptions,
+    on_event: F,
+) -> Result<String>
+where
+    F: Fn(AiStreamEvent) + Send + Sync + 'static,
+{
+    on_event(AiStreamEvent::Status("Loading...".into()));
+
+    if provider.id == "agy" {
+        return ask_agy_streaming(prompt, opts, on_event).await;
+    }
+
+    on_event(AiStreamEvent::Status(format!(
+        "Waiting for {}...",
+        provider.name
+    )));
+    ask_provider_with_options(provider, prompt, opts).await
+}
+
+async fn ask_agy_streaming<F>(
+    prompt: &str,
+    opts: &AiRequestOptions,
+    on_event: F,
+) -> Result<String>
+where
+    F: Fn(AiStreamEvent) + Send + Sync + 'static,
+{
+    let model_override = opts
+        .model
+        .as_deref()
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("auto"));
+    let agent_override = opts
+        .agent
+        .as_deref()
+        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("default"));
+    let sys_inst = opts
+        .system_instruction
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let effective_prompt = match sys_inst {
+        Some(inst) => format!("[System Instruction: {inst}]\n\n{prompt}"),
+        None => prompt.to_string(),
+    };
+    let cli_prompt_with_files = if opts.attachments.is_empty() {
+        effective_prompt
+    } else {
+        let list = opts
+            .attachments
+            .iter()
+            .map(|p| format!("- {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{effective_prompt}\n\n[Attached images — please read/inspect these files:\n{list}]")
+    };
+
+    let mut args: Vec<String> = vec!["--output-format".into(), "stream-json".into()];
+    if let Some(cid) = opts.conversation_id.as_deref().filter(|s| !s.is_empty()) {
+        args.push("--conversation".into());
+        args.push(cid.into());
+    } else if opts.continue_conversation {
+        args.push("--continue".into());
+    }
+    let model_has_level = model_override
+        .map(|m| split_model_and_level(m).1.is_some())
+        .unwrap_or(false);
+    if let Some(m) = model_override {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    if let Some(a) = agent_override {
+        args.push("--agent".into());
+        args.push(a.into());
+    }
+    if !model_has_level {
+        args.push("--effort".into());
+        args.push(opts.effort.api_value().into());
+    }
+    if let Some(mode) = opts.mode.as_deref().filter(|m| !m.is_empty()) {
+        args.push("--mode".into());
+        args.push(mode.into());
+        if mode == "auto" {
+            // Non-interactive `-p` mode has no stdin to approve tool calls (e.g. git status/diff)
+            args.push("--dangerously-skip-permissions".into());
+        }
+    }
+    if opts.timeout_secs > 0 {
+        args.push("--print-timeout".into());
+        args.push(format!("{}s", opts.timeout_secs));
+    }
+    for img in &opts.attachments {
+        if let Some(parent) = img.parent() {
+            args.push("--add-dir".into());
+            args.push(parent.display().to_string());
+        }
+    }
+    args.push("-p".into());
+    args.push(cli_prompt_with_files);
+
+    let mut cmd = Command::new("agy");
+    cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = &opts.working_dir {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().context("Failed to spawn `agy`")?;
+
+    let stdout = child.stdout.take().context("Missing stdout from agy")?;
+    let stderr = child.stderr.take();
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(err_stream) = stderr {
+            let mut reader = BufReader::new(err_stream).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(&line);
+            }
+        }
+        buf
+    });
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut final_text = String::new();
+    let mut streamed_text = String::new();
+    let mut raw_fallback = String::new();
+
+    on_event(AiStreamEvent::Status("Thinking...".into()));
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            handle_stream_json_event(&val, &on_event, &mut final_text, &mut streamed_text);
+        } else {
+            if !raw_fallback.is_empty() {
+                raw_fallback.push('\n');
+            }
+            raw_fallback.push_str(trimmed);
+        }
+    }
+
+    let status = child.wait().await?;
+    let stderr_text = stderr_handle.await.unwrap_or_default();
+
+    let reply = if !final_text.trim().is_empty() {
+        final_text.trim().to_string()
+    } else if !streamed_text.trim().is_empty() {
+        streamed_text.trim().to_string()
+    } else {
+        raw_fallback.trim().to_string()
+    };
+
+    if status.success() {
+        Ok(if !reply.is_empty() {
+            reply
+        } else if !stderr_text.trim().is_empty() {
+            stderr_text.trim().to_string()
+        } else {
+            "(empty response)".to_string()
+        })
+    } else {
+        Err(anyhow!(
+            "`agy` exited with {}: {}",
+            status,
+            if stderr_text.trim().is_empty() {
+                reply
+            } else {
+                stderr_text.trim().to_string()
+            }
+        ))
+    }
+}
+
+fn handle_stream_json_event<F>(
+    val: &serde_json::Value,
+    on_event: &F,
+    final_text: &mut String,
+    streamed_text: &mut String,
+) where
+    F: Fn(AiStreamEvent),
+{
+    let ev_type = val["type"]
+        .as_str()
+        .or_else(|| val["event"].as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Capture conversation/session ID so follow-up turns resume the exact same conversation
+    if let Some(cid) = val["conversation_id"]
+        .as_str()
+        .or_else(|| val["step_update"]["conversation_id"].as_str())
+        .or_else(|| val["result"]["conversation_id"].as_str())
+        .or_else(|| val["session_id"].as_str())
+        .or_else(|| val["conversationId"].as_str())
+        .filter(|s| !s.is_empty())
+    {
+        on_event(AiStreamEvent::ConversationId(cid.to_string()));
+    }
+
+    // 0. Native Antigravity CLI (`agy --output-format stream-json`) `step_update` envelope
+    if ev_type == "step_update" {
+        if let Some(su) = val.get("step_update").and_then(|v| v.as_object()) {
+            let step_type = su
+                .get("step_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let state = su
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            let is_done = matches!(state.as_str(), "DONE" | "COMPLETED" | "FAILED" | "CANCELLED");
+
+            if step_type == "user_input"
+                || step_type == "finish"
+                || step_type == "checkpoint"
+                || step_type.is_empty()
+            {
+                return;
+            }
+            if step_type == "agent_response" || step_type == "response" {
+                if let Some(delta) = su.get("text_delta").and_then(|v| v.as_str()) {
+                    if !delta.is_empty() {
+                        on_event(AiStreamEvent::Status("Writing response...".into()));
+                        streamed_text.push_str(delta);
+                    }
+                }
+                if let Some(full) = su
+                    .get("response")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| su.get("text").and_then(|v| v.as_str()))
+                {
+                    if !full.trim().is_empty() {
+                        *final_text = full.to_string();
+                    }
+                }
+                return;
+            }
+            if step_type.contains("think")
+                || step_type.contains("thought")
+                || step_type.contains("reason")
+            {
+                on_event(AiStreamEvent::Status("Thinking...".into()));
+                if let Some(t) = su
+                    .get("thought_delta")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| su.get("text_delta").and_then(|v| v.as_str()))
+                    .or_else(|| su.get("thinking").and_then(|v| v.as_str()))
+                    .or_else(|| su.get("text").and_then(|v| v.as_str()))
+                {
+                    let snippet = t.lines().next().unwrap_or("").trim();
+                    if !snippet.is_empty() {
+                        on_event(AiStreamEvent::Thought(snippet.chars().take(120).collect()));
+                    }
+                }
+                return;
+            }
+
+            // Tool step (`view_file`, `read_file`, `replace_file_content`, `write_to_file`, `run_command`, `grep_search`, etc.)
+            let tool_name = su
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| su.get("name").and_then(|v| v.as_str()))
+                .unwrap_or(&step_type);
+            let detail = extract_tool_detail(&val["step_update"]);
+            emit_tool_activity(tool_name, &detail, is_done, on_event);
+            return;
+        }
+    }
+
+    // 1. Final result envelope (`result` can be a string or an object)
+    if ev_type == "result" || ev_type == "final" || ev_type == "done" || ev_type == "complete" {
+        if let Some(res) = extract_text_from_value(&val["result"])
+            .or_else(|| extract_text_from_value(&val["response"]))
+            .or_else(|| extract_text_from_value(&val["output"]))
+            .or_else(|| extract_text_from_value(&val["message"]))
+            .or_else(|| extract_text_from_value(&val["text"]))
+        {
+            if !res.trim().is_empty() {
+                *final_text = res;
+            }
+        }
+        return;
+    }
+
+    // 2. Thinking / reasoning events
+    if ev_type.contains("thought") || ev_type.contains("thinking") || ev_type.contains("reason") {
+        on_event(AiStreamEvent::Status("Thinking...".into()));
+        if let Some(t) = val["text"]
+            .as_str()
+            .or_else(|| val["thinking"].as_str())
+            .or_else(|| val["content"].as_str())
+            .or_else(|| val["delta"].as_str())
+        {
+            let snippet = t.lines().next().unwrap_or("").trim();
+            if !snippet.is_empty() {
+                on_event(AiStreamEvent::Thought(snippet.chars().take(120).collect()));
+            }
+        }
+        return;
+    }
+
+    // 3. Direct tool_use / tool_call / tool_result events
+    if ev_type.contains("tool") {
+        let name = val["name"]
+            .as_str()
+            .or_else(|| val["tool_name"].as_str())
+            .or_else(|| val["tool"].as_str())
+            .unwrap_or("tool");
+        let is_done =
+            ev_type.contains("result") || ev_type.contains("end") || ev_type.contains("complete");
+        let detail = extract_tool_detail(val);
+        emit_tool_activity(name, &detail, is_done, on_event);
+        return;
+    }
+
+    // 4. Structured content array (`message.content` or `content` or `parts`)
+    if let Some(content_arr) = val["message"]["content"]
+        .as_array()
+        .or_else(|| val["content"].as_array())
+        .or_else(|| val["parts"].as_array())
+    {
+        for block in content_arr {
+            let btype = block["type"].as_str().unwrap_or("");
+            match btype {
+                "thinking" | "thought" => {
+                    on_event(AiStreamEvent::Status("Thinking...".into()));
+                    if let Some(t) = block["thinking"].as_str().or_else(|| block["text"].as_str()) {
+                        let snippet = t.lines().next().unwrap_or("").trim();
+                        if !snippet.is_empty() {
+                            on_event(AiStreamEvent::Thought(snippet.chars().take(120).collect()));
+                        }
+                    }
+                }
+                "tool_use" | "tool_call" => {
+                    let name = block["name"].as_str().unwrap_or("tool");
+                    let detail = extract_tool_detail(block);
+                    emit_tool_activity(name, &detail, false, on_event);
+                }
+                "tool_result" => {
+                    let name = block["name"].as_str().unwrap_or("tool");
+                    let detail = extract_tool_detail(block);
+                    emit_tool_activity(name, &detail, true, on_event);
+                }
+                "text" | "" => {
+                    if let Some(txt) = block["text"].as_str() {
+                        if !txt.is_empty() {
+                            on_event(AiStreamEvent::Status("Writing response...".into()));
+                            if ev_type.contains("delta") {
+                                streamed_text.push_str(txt);
+                            } else {
+                                *final_text = txt.to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // 5. String `content`, `message`, `response`, `delta`, or `text` fields
+    let is_user_echo = val["role"].as_str() == Some("user")
+        || ev_type == "user"
+        || ev_type == "system"
+        || ev_type == "init";
+    if is_user_echo {
+        return;
+    }
+
+    if let Some(delta) = val["delta"]["text"]
+        .as_str()
+        .or_else(|| val["delta"]["content"].as_str())
+        .or_else(|| val["delta"].as_str())
+    {
+        if !delta.is_empty() {
+            on_event(AiStreamEvent::Status("Writing response...".into()));
+            streamed_text.push_str(delta);
+            return;
+        }
+    }
+
+    if let Some(txt) = val["message"]["content"]
+        .as_str()
+        .or_else(|| val["message"]["text"].as_str())
+        .or_else(|| val["content"].as_str())
+        .or_else(|| val["response"].as_str())
+        .or_else(|| val["text"].as_str())
+        .or_else(|| val["result"].as_str())
+    {
+        if !txt.is_empty() {
+            on_event(AiStreamEvent::Status("Writing response...".into()));
+            if ev_type.contains("delta") || ev_type.contains("chunk") {
+                streamed_text.push_str(txt);
+            } else {
+                *final_text = txt.to_string();
+            }
+        }
+    }
+}
+
+fn extract_text_from_value(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(obj) = v.as_object() {
+        for key in ["text", "content", "response", "output", "message"] {
+            if let Some(val) = obj.get(key) {
+                if let Some(s) = extract_text_from_value(val) {
+                    if !s.trim().is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(arr) = v.as_array() {
+        let joined: Vec<String> = arr
+            .iter()
+            .filter_map(|item| {
+                if item["type"].as_str() == Some("thinking")
+                    || item["type"].as_str() == Some("thought")
+                {
+                    return None;
+                }
+                extract_text_from_value(item)
+            })
+            .collect();
+        if !joined.is_empty() {
+            return Some(joined.join("\n"));
+        }
+    }
+    None
+}
+
+fn extract_tool_detail(val: &serde_json::Value) -> String {
+    const DETAIL_KEYS: &[&str] = &[
+        "toolSummary",
+        "tool_summary",
+        "summary",
+        "title",
+        "CommandLine",
+        "command_line",
+        "command",
+        "Path",
+        "path",
+        "file_path",
+        "absolute_path",
+        "AbsolutePath",
+        "TargetFile",
+        "target_file",
+        "DirectoryPath",
+        "directory_path",
+        "SearchPath",
+        "query",
+        "Query",
+    ];
+
+    fn pick_from_obj(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        for key in DETAIL_KEYS {
+            if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    let lk = key.to_lowercase();
+                    if lk.contains("path") || lk.contains("file") {
+                        if let Some(name) = Path::new(trimmed).file_name() {
+                            return Some(name.to_string_lossy().to_string());
+                        }
+                    }
+                    return Some(trimmed.chars().take(60).collect());
+                }
+            }
+        }
+        None
+    }
+
+    if let Some(obj) = val.as_object() {
+        // 1. Check common wrapper objects first (`input`, `args`, `arguments`)
+        for wrapper in ["input", "args", "arguments"] {
+            if let Some(sub) = obj.get(wrapper).and_then(|v| v.as_object()) {
+                if let Some(found) = pick_from_obj(sub) {
+                    return found;
+                }
+            }
+        }
+        // 2. Check top-level fields
+        if let Some(found) = pick_from_obj(obj) {
+            return found;
+        }
+        // 3. Check any nested sub-object (e.g. `step_update.run_command`, `step_update.view_file`)
+        for (_k, v) in obj {
+            if let Some(sub) = v.as_object() {
+                if let Some(found) = pick_from_obj(sub) {
+                    return found;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn emit_tool_activity<F>(tool_name: &str, detail: &str, done: bool, on_event: &F)
+where
+    F: Fn(AiStreamEvent),
+{
+    let lower = tool_name.to_lowercase();
+    let (verb_ing, verb_done, status_msg) = if lower.contains("read") || lower.contains("view") {
+        ("Reading", "Read", "Reading files...")
+    } else if lower.contains("edit") || lower.contains("write") || lower.contains("replace") {
+        ("Editing", "Edited", "Editing files...")
+    } else if lower.contains("command") || lower.contains("bash") || lower.contains("shell") {
+        ("Running", "Ran", "Running command...")
+    } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") {
+        ("Searching", "Searched", "Searching...")
+    } else {
+        ("Using", "Used", "Working...")
+    };
+
+    if !done {
+        on_event(AiStreamEvent::Status(status_msg.into()));
+    }
+    on_event(AiStreamEvent::Activity {
+        done,
+        verb: if done { verb_done } else { verb_ing }.into(),
+        detail: detail.to_string(),
+    });
 }
 
 /// Send a prompt to the chosen AI provider with explicit model, agent mode, and effort level.
