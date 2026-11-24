@@ -429,6 +429,121 @@ fn replace_existing_instance() {
     let _ = std::fs::write(&pid_path, current_pid.to_string());
 }
 
+/// Build a crisp 256x256 macOS-style rounded-square `?` icon for `cli arai`.
+fn build_app_icon() -> egui::IconData {
+    let size: usize = 256;
+    let mut rgba = vec![0u8; size * size * 4];
+    let s = size as f32;
+
+    // Helper: distance from point p to line segment a-b
+    let dist_seg = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
+        let pax = px - ax;
+        let pay = py - ay;
+        let bax = bx - ax;
+        let bay = by - ay;
+        let h = ((pax * bax + pay * bay) / (bax * bax + bay * bay)).clamp(0.0, 1.0);
+        let dx = pax - bax * h;
+        let dy = pay - bay * h;
+        (dx * dx + dy * dy).sqrt()
+    };
+
+    // Signed distance for rounded box centered at (0, 0) with half-size b and corner radius r
+    let sd_round_box = |px: f32, py: f32, bx: f32, by: f32, r: f32| -> f32 {
+        let qx = px.abs() - bx + r;
+        let qy = py.abs() - by + r;
+        let out = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+        let inside = qx.max(qy).min(0.0);
+        out + inside - r
+    };
+
+    // Question mark geometry in normalized [-1, 1] coordinates
+    let stroke_r = 0.095_f32;
+    let arc_cx = 0.0_f32;
+    let arc_cy = -0.22_f32;
+    let arc_r = 0.25_f32;
+
+    for y in 0..size {
+        for x in 0..size {
+            // Normalized coords in [-1, 1]
+            let nx = ((x as f32 + 0.5) / s) * 2.0 - 1.0;
+            let ny = ((y as f32 + 0.5) / s) * 2.0 - 1.0;
+
+            // 1. Rounded square background (macOS Dock icon proportions)
+            let box_d = sd_round_box(nx, ny, 0.86, 0.86, 0.36);
+            let bg_alpha = (0.5 - box_d / 0.018).clamp(0.0, 1.0);
+            if bg_alpha <= 0.0 {
+                continue;
+            }
+
+            // Subtle dark gradient background (#171A21 -> #0E1015)
+            let grad = ((ny + 1.0) * 0.5).clamp(0.0, 1.0);
+            let mut r = (24.0 - grad * 10.0) as f32;
+            let mut g = (27.0 - grad * 11.0) as f32;
+            let mut b = (34.0 - grad * 13.0) as f32;
+
+            // Subtle inner highlight border
+            let border = (1.0 - (box_d + 0.02).abs() / 0.022).clamp(0.0, 1.0) * 0.22;
+            r += border * 120.0;
+            g += border * 128.0;
+            b += border * 145.0;
+
+            // 2. Question mark `?` SDF
+            let mut q_dist = 10.0_f32;
+
+            // Top arc: angle from -175° (left) through -90° (top) to +25° (right-bottom)
+            let dx = nx - arc_cx;
+            let dy = ny - arc_cy;
+            let ang = dy.atan2(dx); // [-PI, PI]
+            let start_ang = -3.05_f32; // ~ -175 deg
+            let end_ang = 0.45_f32;    // ~ +26 deg
+            if ang >= start_ang && ang <= end_ang {
+                let d_ring = ((dx * dx + dy * dy).sqrt() - arc_r).abs();
+                q_dist = q_dist.min(d_ring);
+            } else {
+                // Rounded end-caps of the arc
+                let sx = arc_cx + arc_r * start_ang.cos();
+                let sy = arc_cy + arc_r * start_ang.sin();
+                let ex = arc_cx + arc_r * end_ang.cos();
+                let ey = arc_cy + arc_r * end_ang.sin();
+                q_dist = q_dist
+                    .min(((nx - sx).powi(2) + (ny - sy).powi(2)).sqrt())
+                    .min(((nx - ex).powi(2) + (ny - ey).powi(2)).sqrt());
+            }
+
+            // Diagonal curve connecting arc end to vertical stem
+            let ex = arc_cx + arc_r * end_ang.cos();
+            let ey = arc_cy + arc_r * end_ang.sin();
+            q_dist = q_dist.min(dist_seg(nx, ny, ex, ey, 0.0, 0.14));
+
+            // Vertical stem down to (0.0, 0.28)
+            q_dist = q_dist.min(dist_seg(nx, ny, 0.0, 0.14, 0.0, 0.26));
+
+            // Dot at (0.0, 0.54)
+            let dot_d = (nx * nx + (ny - 0.54).powi(2)).sqrt() - 0.105;
+
+            let glyph_d = (q_dist - stroke_r).min(dot_d);
+            let glyph_alpha = (0.5 - glyph_d / 0.022).clamp(0.0, 1.0);
+
+            // Composite crisp white `?` over dark icon background
+            r = r * (1.0 - glyph_alpha) + 248.0 * glyph_alpha;
+            g = g * (1.0 - glyph_alpha) + 250.0 * glyph_alpha;
+            b = b * (1.0 - glyph_alpha) + 252.0 * glyph_alpha;
+
+            let idx = (y * size + x) * 4;
+            rgba[idx] = r.clamp(0.0, 255.0) as u8;
+            rgba[idx + 1] = g.clamp(0.0, 255.0) as u8;
+            rgba[idx + 2] = b.clamp(0.0, 255.0) as u8;
+            rgba[idx + 3] = (bg_alpha * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
+
 pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
     replace_existing_instance();
     let cwd = std::env::current_dir()?;
@@ -436,6 +551,7 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("cli arai")
+            .with_icon(build_app_icon())
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1024.0, 660.0])
             .with_fullsize_content_view(true)
