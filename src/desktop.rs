@@ -564,7 +564,6 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
             .with_icon(build_app_icon())
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1024.0, 660.0])
-            .with_decorations(!cfg!(windows))
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false),
@@ -1160,9 +1159,20 @@ impl DesktopApp {
         self.ai_conversation_id = None;
         self.chat.push(ChatMessage::system(msg.clone()));
         if let Some(tab) = self.term_tabs.get_mut(self.active_term_idx) {
-            tab.cwd = new_dir;
+            tab.cwd = new_dir.clone();
             tab.refresh_branch();
             tab.lines.push((msg, TermLineKind::Command));
+            if let Some(pty) = &mut tab.pty {
+                let cd_cmd = if cfg!(windows) {
+                    format!("cd \"{}\"\r\n", new_dir.display())
+                } else {
+                    format!(
+                        "cd '{}'\n",
+                        new_dir.display().to_string().replace('\'', "'\\''")
+                    )
+                };
+                pty.write_bytes(cd_cmd.as_bytes());
+            }
         }
     }
 
@@ -1204,13 +1214,12 @@ impl DesktopApp {
                             ai::select_provider(&self.providers, None).map(|p| p.id.clone());
                     }
                     if let Some(p) = self.active_provider().cloned() {
-                        if !self.settings.approved_providers.contains(&p.id)
-                            && self.pending_permission_provider.is_none()
-                        {
+                        if self.settings.approved_providers.contains(&p.id) {
+                            self.fetch_provider_capabilities(p.id);
+                        } else if self.pending_permission_provider.is_none() {
                             self.pending_permission_provider =
                                 Some((p.id.clone(), p.name.clone()));
                         }
-                        self.fetch_provider_capabilities(p.id);
                     }
                     if available.is_empty() {
                         self.chat.push(ChatMessage::system(
@@ -3155,80 +3164,20 @@ impl eframe::App for DesktopApp {
         let accent = self.accent_color();
 
         // 1A. Dedicated Themed macOS Titlebar Strip (traffic lights on left, full-width drag + double-click)
-        if cfg!(target_os = "macos") || cfg!(windows) {
+        if cfg!(target_os = "macos") {
             let titlebar_resp = egui::TopBottomPanel::top("macos_titlebar_strip")
                 .exact_height(28.0)
                 .show_separator_line(false)
                 .frame(Frame::new().fill(panel_bg))
                 .show(ctx, |ui| {
-                    if cfg!(windows) {
-                        ui.horizontal_centered(|ui| {
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new("cli arai")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(t.text_muted),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add_space(4.0);
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("✕").size(12.0).color(t.text_muted),
-                                        )
-                                        .frame(false)
-                                        .min_size(egui::vec2(32.0, 24.0)),
-                                    )
-                                    .on_hover_text("Close")
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                }
-                                let is_maximized =
-                                    ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(if is_maximized { "❐" } else { "□" })
-                                                .size(12.0)
-                                                .color(t.text_muted),
-                                        )
-                                        .frame(false)
-                                        .min_size(egui::vec2(32.0, 24.0)),
-                                    )
-                                    .on_hover_text(if is_maximized { "Restore" } else { "Maximize" })
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
-                                        !is_maximized,
-                                    ));
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("—").size(12.0).color(t.text_muted),
-                                        )
-                                        .frame(false)
-                                        .min_size(egui::vec2(32.0, 24.0)),
-                                    )
-                                    .on_hover_text("Minimize")
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                                }
-                            });
-                        });
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                RichText::new("cli arai")
-                                    .size(12.0)
-                                    .strong()
-                                    .color(t.text_muted),
-                            );
-                        });
-                    }
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("cli arai")
+                                .size(12.0)
+                                .strong()
+                                .color(t.text_muted),
+                        );
+                    });
                 })
                 .response;
 
