@@ -448,8 +448,9 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
         "cli arai",
         options,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
             let loaded_settings = AppSettings::load();
+            let system_fonts = discover_system_fonts();
+            setup_fonts(&cc.egui_ctx, &loaded_settings.font_family, &system_fonts);
             ui_components::apply_theme(&cc.egui_ctx, loaded_settings.dark_mode);
             Ok(Box::new(DesktopApp::new(
                 rt,
@@ -457,13 +458,94 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
                 tracker,
                 cc.egui_ctx.clone(),
                 loaded_settings,
+                system_fonts,
             )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("Desktop window error: {e}"))
 }
 
-fn setup_fonts(ctx: &egui::Context) {
+fn discover_system_fonts() -> Vec<(String, PathBuf)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = PathBuf::from(home);
+        dirs.push(h.join("Library/Fonts"));
+        dirs.push(h.join(".local/share/fonts"));
+    }
+    dirs.push(PathBuf::from("/Library/Fonts"));
+    dirs.push(PathBuf::from("/System/Library/Fonts"));
+    dirs.push(PathBuf::from("/System/Library/Fonts/Supplemental"));
+    dirs.push(PathBuf::from("/usr/share/fonts"));
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if ext != "ttf" && ext != "otf" {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if stem.starts_with('.') {
+                    continue;
+                }
+                let display = stem.to_string();
+                let key = display.to_ascii_lowercase();
+                if seen.insert(key) {
+                    found.push((display, path));
+                }
+            }
+        }
+    }
+
+    found.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    found
+}
+
+fn setup_fonts(
+    ctx: &egui::Context,
+    selected_font_name: &str,
+    system_fonts: &[(String, PathBuf)],
+) {
+    let mut fonts = FontDefinitions::default();
+
+    // 1. User-selected system font (placed first in both Proportional & Monospace)
+    if !selected_font_name.is_empty() && selected_font_name != "Default" {
+        if let Some((_, path)) = system_fonts
+            .iter()
+            .find(|(name, _)| name == selected_font_name)
+        {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert("user_font".to_owned(), Arc::new(FontData::from_owned(bytes)));
+                fonts
+                    .families
+                    .entry(FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "user_font".to_owned());
+                fonts
+                    .families
+                    .entry(FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "user_font".to_owned());
+            }
+        }
+    }
+
+    // 2. Thai fallback font so Thai text always renders cleanly
     let candidates = [
         "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
         "/System/Library/Fonts/Supplemental/Tahoma.ttf",
@@ -471,10 +553,8 @@ fn setup_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
     ];
-
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = FontDefinitions::default();
             fonts
                 .font_data
                 .insert("thai_font".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -488,10 +568,11 @@ fn setup_fonts(ctx: &egui::Context) {
                 .entry(FontFamily::Monospace)
                 .or_default()
                 .push("thai_font".to_owned());
-            ctx.set_fonts(fonts);
-            return;
+            break;
         }
     }
+
+    ctx.set_fonts(fonts);
 }
 
 struct DesktopApp {
@@ -550,6 +631,7 @@ struct DesktopApp {
 
     // Persisted App Settings + Hot-reloadable Rune config (`config.rn`)
     settings: AppSettings,
+    system_fonts: Vec<(String, PathBuf)>,
     show_settings_modal: bool,
     settings_tab: SettingsTab,
     settings_status: Option<String>,
@@ -736,6 +818,7 @@ impl DesktopApp {
         tracker: ChangeTracker,
         ctx: egui::Context,
         settings: AppSettings,
+        system_fonts: Vec<(String, PathBuf)>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let changes = tracker.snapshot(&cwd);
@@ -805,6 +888,7 @@ impl DesktopApp {
             active_term_idx: 0,
             next_term_id: 2,
             settings,
+            system_fonts,
             show_settings_modal: false,
             settings_tab: SettingsTab::General,
             settings_status: None,
@@ -1562,7 +1646,7 @@ impl DesktopApp {
                                     let lbl = egui::Label::new(
                                         RichText::new(&dl.content)
                                             .monospace()
-                                            .size(self.settings.code_font_size.clamp(9.0, 22.0))
+                                            .size(self.settings.diff_font_size.clamp(9.0, 22.0))
                                             .color(fg),
                                     );
                                     if self.settings.word_wrap_diff {
@@ -1615,7 +1699,7 @@ impl DesktopApp {
     fn render_bottom_prompt(&mut self, ui: &mut egui::Ui) {
         let t = self.theme();
         let accent = self.accent_color();
-        let font_sz = self.settings.code_font_size.clamp(10.5, 18.0);
+        let font_sz = self.settings.ai_font_size.clamp(10.0, 22.0);
 
         // Minimal top strip (AI + spinner only | Clear right)
         ui.horizontal(|ui| {
@@ -1721,10 +1805,10 @@ impl DesktopApp {
                             .color(t.accent_indigo),
                     );
                     let resp = ui.add_sized(
-                        [(ui.available_width() - 4.0).max(80.0), 22.0],
+                        [(ui.available_width() - 4.0).max(80.0), (font_sz + 10.0).max(24.0)],
                         TextEdit::multiline(&mut self.prompt_input)
                             .frame(false)
-                            .font(egui::TextStyle::Monospace)
+                            .font(egui::FontId::monospace(font_sz))
                             .desired_rows(1)
                             .text_color(t.text_primary),
                     );
@@ -2416,7 +2500,7 @@ impl DesktopApp {
 
         // 3. Real VS Code-style Interactive PTY Terminal inside CentralPanel
         let accent = self.accent_color();
-        let term_font_size = self.settings.code_font_size.clamp(10.0, 20.0);
+        let term_font_size = self.settings.terminal_font_size.clamp(10.0, 22.0);
         let ctx_clone = self.ctx.clone();
         let mut restart_active = false;
 
@@ -3985,8 +4069,8 @@ impl eframe::App for DesktopApp {
             let mut reset_clicked = false;
 
             let screen = ctx.screen_rect();
-            let modal_w = (screen.width() - 40.0).min(500.0).max(320.0);
-            let modal_h = (screen.height() - 40.0).min(355.0).max(260.0);
+            let modal_w = (screen.width() - 40.0).min(520.0).max(340.0);
+            let modal_h = (screen.height() - 40.0).min(460.0).max(320.0);
 
             egui::Window::new("Settings")
                 .title_bar(false)
@@ -4057,14 +4141,82 @@ impl eframe::App for DesktopApp {
                                     ui.end_row();
 
                                     ui.label(
-                                        RichText::new("Code Font Size")
+                                        RichText::new("Font Family")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    let prev_font = self.settings.font_family.clone();
+                                    let current_font_label = if self.settings.font_family.is_empty()
+                                    {
+                                        "Default".to_string()
+                                    } else {
+                                        self.settings.font_family.clone()
+                                    };
+                                    egui::ComboBox::from_id_salt("settings_font_family")
+                                        .selected_text(&current_font_label)
+                                        .width(240.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.settings.font_family,
+                                                "Default".to_string(),
+                                                "Default",
+                                            );
+                                            for (name, _) in &self.system_fonts {
+                                                ui.selectable_value(
+                                                    &mut self.settings.font_family,
+                                                    name.clone(),
+                                                    name,
+                                                );
+                                            }
+                                        });
+                                    if self.settings.font_family != prev_font {
+                                        setup_fonts(
+                                            ctx,
+                                            &self.settings.font_family,
+                                            &self.system_fonts,
+                                        );
+                                    }
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Diff Font Size")
                                             .size(12.5)
                                             .color(t.text_secondary),
                                     );
                                     ui.add(
                                         egui::Slider::new(
-                                            &mut self.settings.code_font_size,
-                                            10.0..=20.0,
+                                            &mut self.settings.diff_font_size,
+                                            10.0..=22.0,
+                                        )
+                                        .step_by(0.5)
+                                        .suffix(" px"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("AI Font Size")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.settings.ai_font_size,
+                                            10.0..=22.0,
+                                        )
+                                        .step_by(0.5)
+                                        .suffix(" px"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label(
+                                        RichText::new("Terminal Font Size")
+                                            .size(12.5)
+                                            .color(t.text_secondary),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.settings.terminal_font_size,
+                                            10.0..=22.0,
                                         )
                                         .step_by(0.5)
                                         .suffix(" px"),
@@ -4266,26 +4418,40 @@ impl eframe::App for DesktopApp {
                     });
                 });
 
-            if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.show_settings_modal = false;
-            }
             if reset_clicked {
                 self.settings = AppSettings::default();
                 self.dark_mode = self.settings.dark_mode;
+                self.show_diff_preview = self.settings.show_diff_preview;
+                self.show_ai_panel = self.settings.show_ai_panel;
+                self.show_terminal_panel = self.settings.show_terminal_panel;
                 ui_components::apply_theme(ctx, self.dark_mode);
-                self.settings_status = Some("รีเซ็ตเป็นค่าเริ่มต้นแล้ว (กด Save เพื่อบันทึก)".into());
+                setup_fonts(ctx, &self.settings.font_family, &self.system_fonts);
+                let _ = self.settings.save();
+                self.settings_status = Some("รีเซ็ตเป็นค่าเริ่มต้นและบันทึกแล้ว".into());
             }
             if save_clicked {
                 self.settings.dark_mode = self.dark_mode;
+                self.settings.selected_provider_id = self.selected_provider_id.clone();
+                self.settings.selected_base_model = self.selected_base_model.clone();
+                self.settings.selected_level = self.selected_level.clone();
+                self.settings.selected_agent = self.selected_agent.clone();
+                self.settings.show_diff_preview = self.show_diff_preview;
+                self.settings.show_ai_panel = self.show_ai_panel;
+                self.settings.show_terminal_panel = self.show_terminal_panel;
                 match self.settings.save() {
                     Ok(path) => {
                         self.settings_status =
                             Some(format!("บันทึกแล้วที่ {}", path.display()));
+                        self.show_settings_modal = false;
                     }
                     Err(e) => {
                         self.settings_status = Some(format!("บันทึกไม่สำเร็จ: {e}"));
                     }
                 }
+            } else if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.settings.dark_mode = self.dark_mode;
+                self.persist_ui_state();
+                self.show_settings_modal = false;
             }
         }
     }

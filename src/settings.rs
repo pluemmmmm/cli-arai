@@ -7,7 +7,11 @@ use std::path::PathBuf;
 pub struct AppSettings {
     // Appearance & Editor
     pub dark_mode: bool,
+    pub font_family: String, // "Default" or installed system font name
     pub code_font_size: f32,
+    pub diff_font_size: f32,
+    pub ai_font_size: f32,
+    pub terminal_font_size: f32,
     pub auto_refresh_diff: bool,
     pub auto_refresh_secs: u64,
     pub word_wrap_diff: bool,
@@ -35,7 +39,11 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dark_mode: true,
+            font_family: "Default".to_string(),
             code_font_size: 12.5,
+            diff_font_size: 12.5,
+            ai_font_size: 12.5,
+            terminal_font_size: 12.5,
             auto_refresh_diff: true,
             auto_refresh_secs: 2,
             word_wrap_diff: true,
