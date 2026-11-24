@@ -546,7 +546,16 @@ fn build_app_icon() -> egui::IconData {
 
 pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
     replace_existing_instance();
-    let cwd = std::env::current_dir()?;
+    let mut cwd = std::env::current_dir()?;
+    // macOS `.app` bundles launch with `/` as cwd; fall back to $HOME so tools/git/terminal start cleanly
+    if cwd == std::path::Path::new("/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home_path = PathBuf::from(home);
+            if home_path.is_dir() {
+                cwd = home_path;
+            }
+        }
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

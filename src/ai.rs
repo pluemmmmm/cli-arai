@@ -1157,7 +1157,15 @@ pub async fn ask_provider_with_options(
                 run_ai_cli("gemini", &["-p", &cli_prompt_with_files]).await
             }
         }
-        "codex-cli" => run_ai_cli("codex", &["exec", &cli_prompt_with_files]).await,
+        "codex-cli" => {
+            let mut args: Vec<&str> = vec!["exec", "--skip-git-repo-check"];
+            if let Some(m) = model_override {
+                args.push("--model");
+                args.push(m);
+            }
+            args.push(&cli_prompt_with_files);
+            run_ai_cli("codex", &args).await
+        }
         "ollama-cli" => {
             let m = model_override.unwrap_or("llama3");
             run_ai_cli("ollama", &["run", m, &cli_prompt_with_files]).await
