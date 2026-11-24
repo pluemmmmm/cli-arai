@@ -1,0 +1,17 @@
+// ตัวอย่างการใช้ Rune + async/await เพื่อรันคำสั่งและถาม AI
+
+pub async fn main() {
+    let git_status = cli::run_cmd("git status --short").await?;
+    println!("Git status:\n{}", git_status);
+
+    let ais = cli::detect_ai().await;
+    if ais.is_empty() {
+        return "ไม่พบ AI provider ที่พร้อมใช้งานในเครื่อง";
+    }
+
+    let prompt = format!("ช่วยสรุปสถานะ git นี้สั้นๆ 2 บรรทัด:\n{}", git_status);
+    let reply = cli::ask_ai(prompt).await?;
+    println!("AI ตอบว่า:\n{}", reply);
+
+    reply
+}

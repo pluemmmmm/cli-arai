@@ -1,0 +1,22 @@
+// ตัวอย่างสคริปต์ Rune ที่เรียกใช้ Custom Rust Module (`cli::*`) และ `async/await`
+
+pub async fn main() {
+    println!("🚀 เริ่มรันสคริปต์ Rune (async)...");
+
+    // ทดสอบ async sleep จาก Tokio ในฝั่ง Rust
+    cli::sleep_ms(200).await;
+
+    // ตรวจสอบรายชื่อไฟล์ในโฟลเดอร์ปัจจุบัน
+    let files = cli::list_dir(".")?;
+    println!("📁 ไฟล์ในโฟลเดอร์ปัจจุบัน: {:?}", files);
+
+    // ตรวจสอบ AI ที่มีอยู่ในเครื่อง
+    let ais = cli::detect_ai().await;
+    println!("🤖 AI ที่ตรวจพบในเครื่อง: {:?}", ais);
+
+    // ทดสอบเขียนไฟล์ (จะถูกบันทึกเข้า Changes/Diff UI อัตโนมัติเมื่อรันใน TUI)
+    let msg = cli::write_file("tmp_rune_demo.txt", "Hello from Rust + Rune!\nLine 2\n")?;
+    println!("✏️  {}", msg);
+
+    "Done!"
+}

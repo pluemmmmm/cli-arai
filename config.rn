@@ -1,0 +1,29 @@
+// config.rn — แก้ไขไฟล์นี้แล้วกด Save (Cmd+S) เพื่อ Hot Reload หน้าจอ Desktop App ทันที!
+
+pub fn config() {
+    #{
+        // สีธีมหลักมาตรฐาน CLI (VS Code Dark Modern) — แก้แล้วกด Save เพื่อ Hot Reload ได้ทันที
+        accent_hex: "#3B82F6",
+        rune_accent_hex: "#C084FC",
+        bg_canvas_hex: "#181818",
+        bg_panel_hex: "#1F1F1F",
+
+        // ขนาดฟอนต์โค้ดใน Diff Preview
+        code_font_size: 12.5,
+
+        // ปุ่มคำสั่งด่วนใน Separate Terminal (เพิ่ม/ลบได้ทันที)
+        terminal_commands: [
+            "git status",
+            "ls -la",
+            "cargo check",
+            "git log -n 5 --oneline",
+        ],
+
+        // ปุ่มลัดในช่อง AI Prompt รูปแบบ "ชื่อปุ่ม|คำสั่งหรือพร้อมพ์"
+        prompt_presets: [
+            "Detect AI|/ai",
+            "▶ hello.rn|/run examples/hello.rn",
+            "✨ สรุปโปรเจกต์|ช่วยสรุปโครงสร้างโปรเจกต์นี้สั้นๆ 3 บรรทัด",
+        ],
+    }
+}
