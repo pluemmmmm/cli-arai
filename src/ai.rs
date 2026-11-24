@@ -497,10 +497,25 @@ pub async fn detect_providers() -> Vec<AiProvider> {
 
 fn which_in_path(binary: &str) -> Option<String> {
     let path_var = env::var_os("PATH")?;
+    #[cfg(windows)]
+    let exts: Vec<String> = env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
     for dir in env::split_paths(&path_var) {
         let candidate = dir.join(binary);
         if candidate.is_file() {
             return Some(candidate.display().to_string());
+        }
+        #[cfg(windows)]
+        for ext in &exts {
+            let candidate_ext = dir.join(format!("{binary}{ext}"));
+            if candidate_ext.is_file() {
+                return Some(candidate_ext.display().to_string());
+            }
         }
     }
     None

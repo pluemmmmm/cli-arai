@@ -13,12 +13,36 @@
 
 ## การติดตั้งและรัน
 
+### macOS / Linux
+
 > **หมายเหตุ**: หากเครื่องยังไม่มี Rust (`rustc` / `cargo`) ให้ติดตั้งก่อนด้วย:
 > ```bash
 > curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-> # หรือ
+> # หรือ (macOS)
 > brew install rust
 > ```
+
+### Windows (PowerShell)
+
+1. **ติดตั้ง Rust**:
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+   *(หรือดาวน์โหลดจาก https://rustup.rs/)*
+
+2. **ติดตั้ง C/C++ Linker (เลือกอย่างใดอย่างหนึ่ง)**:
+   - **แบบที่ 1 (แนะนำ — Visual Studio Build Tools, ~6–8 GB)**: ดาวน์โหลดจาก https://visualstudio.microsoft.com/visual-cpp-build-tools/ แล้วเลือก **Desktop development with C++**
+   - **แบบที่ 2 (ขนาดเล็ก — MinGW, ~300 MB)**:
+     ```powershell
+     winget install BrechtSanders.WinLibs.POSIX.UCRT
+     rustup default stable-x86_64-pc-windows-gnu
+     ```
+
+3. **หลังติดตั้งเสร็จ** ให้ปิดแล้วเปิด **PowerShell** ใหม่ (แนะนำให้รันบน PowerShell แทน Git Bash เพื่อไม่ให้ `link.exe` ชนกัน)
+
+---
+
+### คำสั่งรันโปรแกรม
 
 ```bash
 # 1. เปิดโปรแกรม Desktop App (ค่าเริ่มต้น)
@@ -44,8 +68,15 @@ cargo run -- repl
 
 หากต้องการให้โปรแกรมรีสตาร์ทอัตโนมัติเมื่อแก้ไขไฟล์ใน `src` หรือ `Cargo.toml` สามารถใช้ `watchexec` ได้:
 
-```bash
-watchexec -r -w src -w Cargo.toml -- cargo run
-```
+- **macOS / Linux**:
+  ```bash
+  brew install watchexec   # หรือ cargo install watchexec-cli
+  watchexec -r -w src -w Cargo.toml -- cargo run
+  ```
 
-> หากยังไม่ได้ติดตั้ง `watchexec` สามารถติดตั้งได้ด้วย `brew install watchexec` หรือ `cargo install watchexec-cli`
+- **Windows (PowerShell)**:
+  ```powershell
+  winget install watchexec.watchexec
+  # ปิดแล้วเปิด PowerShell ใหม่ จากนั้นรัน:
+  watchexec -r -w src -w Cargo.toml --shell=none -- cargo run
+  ```

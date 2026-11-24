@@ -28,7 +28,11 @@ impl PtyTerminal {
             pixel_height: 0,
         })?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = if cfg!(windows) {
+            "powershell.exe".to_string()
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+        };
         let mut cmd = CommandBuilder::new(&shell);
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");

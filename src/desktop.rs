@@ -131,9 +131,10 @@ impl TermTab {
             Ok(p) => (Some(p), None),
             Err(e) => (None, Some(format!("Failed to start PTY shell: {e}"))),
         };
+        let shell_label = if cfg!(windows) { "powershell" } else { "zsh" };
         Self {
             id,
-            name: format!("zsh {id}"),
+            name: format!("{shell_label} {id}"),
             cwd,
             git_branch,
             lines: Vec::new(),
@@ -563,6 +564,7 @@ pub fn run_desktop(rt: Handle, tracker: ChangeTracker) -> Result<()> {
             .with_icon(build_app_icon())
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1024.0, 660.0])
+            .with_decorations(!cfg!(windows))
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false),
@@ -714,6 +716,7 @@ struct DesktopApp {
 
     providers: Vec<AiProvider>,
     selected_provider_id: Option<String>,
+    pending_permission_provider: Option<(String, String)>,
     raw_models: Vec<String>,
     grouped_models: Vec<(String, Vec<String>)>,
     selected_base_model: String,
@@ -974,6 +977,7 @@ impl DesktopApp {
             tracker,
             providers: Vec::new(),
             selected_provider_id: settings.selected_provider_id.clone(),
+            pending_permission_provider: None,
             raw_models: Vec::new(),
             grouped_models: Vec::new(),
             selected_base_model: settings.selected_base_model.clone(),
@@ -1199,8 +1203,14 @@ impl DesktopApp {
                         self.selected_provider_id =
                             ai::select_provider(&self.providers, None).map(|p| p.id.clone());
                     }
-                    if let Some(pid) = self.active_provider().map(|p| p.id.clone()) {
-                        self.fetch_provider_capabilities(pid);
+                    if let Some(p) = self.active_provider().cloned() {
+                        if !self.settings.approved_providers.contains(&p.id)
+                            && self.pending_permission_provider.is_none()
+                        {
+                            self.pending_permission_provider =
+                                Some((p.id.clone(), p.name.clone()));
+                        }
+                        self.fetch_provider_capabilities(p.id);
                     }
                     if available.is_empty() {
                         self.chat.push(ChatMessage::system(
@@ -2005,9 +2015,14 @@ impl DesktopApp {
                                     let selected =
                                         self.selected_provider_id.as_deref() == Some(id.as_str());
                                     if ui.selectable_label(selected, name).clicked() && !selected {
-                                        self.selected_provider_id = Some(id.clone());
-                                        switched_provider_id = Some(id.clone());
-                                        selectors_changed = true;
+                                        if self.settings.approved_providers.contains(id) {
+                                            self.selected_provider_id = Some(id.clone());
+                                            switched_provider_id = Some(id.clone());
+                                            selectors_changed = true;
+                                        } else {
+                                            self.pending_permission_provider =
+                                                Some((id.clone(), name.clone()));
+                                        }
                                     }
                                 }
                             }
@@ -3140,20 +3155,80 @@ impl eframe::App for DesktopApp {
         let accent = self.accent_color();
 
         // 1A. Dedicated Themed macOS Titlebar Strip (traffic lights on left, full-width drag + double-click)
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") || cfg!(windows) {
             let titlebar_resp = egui::TopBottomPanel::top("macos_titlebar_strip")
                 .exact_height(28.0)
                 .show_separator_line(false)
                 .frame(Frame::new().fill(panel_bg))
                 .show(ctx, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("cli arai")
-                                .size(12.0)
-                                .strong()
-                                .color(t.text_muted),
-                        );
-                    });
+                    if cfg!(windows) {
+                        ui.horizontal_centered(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("cli arai")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(t.text_muted),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(4.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("✕").size(12.0).color(t.text_muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(egui::vec2(32.0, 24.0)),
+                                    )
+                                    .on_hover_text("Close")
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                let is_maximized =
+                                    ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(if is_maximized { "❐" } else { "□" })
+                                                .size(12.0)
+                                                .color(t.text_muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(egui::vec2(32.0, 24.0)),
+                                    )
+                                    .on_hover_text(if is_maximized { "Restore" } else { "Maximize" })
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+                                        !is_maximized,
+                                    ));
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("—").size(12.0).color(t.text_muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(egui::vec2(32.0, 24.0)),
+                                    )
+                                    .on_hover_text("Minimize")
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
+                            });
+                        });
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new("cli arai")
+                                    .size(12.0)
+                                    .strong()
+                                    .color(t.text_muted),
+                            );
+                        });
+                    }
                 })
                 .response;
 
@@ -4091,6 +4166,70 @@ impl eframe::App for DesktopApp {
         }
 
         // 5. Modal Dialog: Create New Branch from Current Branch
+        if let Some((perm_id, perm_name)) = self.pending_permission_provider.clone() {
+            egui::Window::new("AI Provider Permission")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .fixed_size(Vec2::new(420.0, 175.0))
+                .frame(
+                    Frame::new()
+                        .fill(t.bg_panel)
+                        .stroke(Stroke::new(1.0, t.border_subtle))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::same(16)),
+                )
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("AI Provider Permission")
+                            .size(14.0)
+                            .strong()
+                            .color(t.text_primary),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Allow \"{}\" ({}) to access your workspace context, run local CLI tools, or send prompts to its API?",
+                            perm_name, perm_id
+                        ))
+                        .size(12.5)
+                        .color(t.text_secondary),
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui_components::primary_button(
+                                ui,
+                                "Allow",
+                                Color32::from_rgb(59, 130, 246),
+                                true,
+                            )
+                            .clicked()
+                            {
+                                if !self.settings.approved_providers.contains(&perm_id) {
+                                    self.settings.approved_providers.push(perm_id.clone());
+                                }
+                                self.selected_provider_id = Some(perm_id.clone());
+                                self.settings.selected_provider_id = Some(perm_id.clone());
+                                self.selected_base_model.clear();
+                                self.selected_level = None;
+                                self.selected_agent = "Default".to_string();
+                                self.raw_models.clear();
+                                self.grouped_models.clear();
+                                let _ = self.settings.save();
+                                self.fetch_provider_capabilities(perm_id);
+                                self.pending_permission_provider = None;
+                            }
+                            ui.add_space(8.0);
+                            if ui_components::subtle_button(ui, "Deny").clicked() {
+                                self.pending_permission_provider = None;
+                            }
+                        });
+                    });
+                });
+        }
+
         if self.show_new_branch_modal {
             let mut open = true;
             let mut create_now = false;
@@ -4479,7 +4618,12 @@ impl eframe::App for DesktopApp {
                                         .selected_text(&self.settings.shell)
                                         .width(140.0)
                                         .show_ui(ui, |ui| {
-                                            for sh in ["zsh", "bash", "sh"] {
+                                            let shells: &[&str] = if cfg!(windows) {
+                                                &["powershell", "cmd", "bash"]
+                                            } else {
+                                                &["zsh", "bash", "sh"]
+                                            };
+                                            for &sh in shells {
                                                 ui.selectable_value(
                                                     &mut self.settings.shell,
                                                     sh.to_string(),

@@ -24,6 +24,7 @@ pub struct AppSettings {
     pub selected_base_model: String,
     pub selected_level: Option<String>,
     pub selected_agent: String,
+    pub approved_providers: Vec<String>,
 
     // Workspace Layout
     pub show_diff_preview: bool,
@@ -54,10 +55,15 @@ impl Default for AppSettings {
             selected_base_model: String::new(),
             selected_level: None,
             selected_agent: "Default".to_string(),
+            approved_providers: Vec::new(),
             show_diff_preview: true,
             show_ai_panel: true,
             show_terminal_panel: true,
-            shell: "zsh".to_string(),
+            shell: if cfg!(windows) {
+                "powershell".to_string()
+            } else {
+                "zsh".to_string()
+            },
             max_terminal_lines: 500,
         }
     }
