@@ -23,11 +23,11 @@ jobs:
           - name: macOS (Apple Silicon)
             os: macos-latest
             target: aarch64-apple-darwin
-            asset_name: cli-arai-macos-arm64.zip
+            asset_name: cli-arai-macos-arm64.dmg
           - name: macOS (Intel)
             os: macos-latest
             target: x86_64-apple-darwin
-            asset_name: cli-arai-macos-x64.zip
+            asset_name: cli-arai-macos-x64.dmg
           - name: Windows (x64)
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -68,11 +68,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package macOS .app bundle
+      - name: Package macOS .dmg installer (drag to Applications)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          APP_DIR="dist/cli-arai.app"
+          DMG_STAGE="dist/dmg"
+          APP_DIR="$DMG_STAGE/cli-arai.app"
           mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
           cp "target/${{ matrix.target }}/release/cli-arai" "$APP_DIR/Contents/MacOS/cli-arai"
           chmod +x "$APP_DIR/Contents/MacOS/cli-arai"
@@ -100,7 +101,14 @@ jobs:
           </dict>
           </plist>
           EOF
-          (cd dist && zip -r "../${{ matrix.asset_name }}" "cli-arai.app")
+          codesign --force --deep --sign - "$APP_DIR"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create \
+            -volname "cli arai" \
+            -srcfolder "$DMG_STAGE" \
+            -ov \
+            -format UDZO \
+            "${{ matrix.asset_name }}"
 
       - name: Package Windows zip
         if: runner.os == 'Windows'
